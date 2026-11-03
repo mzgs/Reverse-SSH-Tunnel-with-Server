@@ -1,141 +1,173 @@
-use crate::settings::Settings;
+use crate::{settings::Settings, tunnel::Profile};
 use gpui_kit::{
-    assets::IconName,
     component::{
-        ActiveTheme, Disableable, WindowExt,
+        ActiveTheme, WindowExt,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
         dialog::{DialogAction, DialogFooter},
-        form::{Field, Form},
         input::{Input, InputState},
     },
     *,
 };
 use std::path::PathBuf;
 
-pub(crate) fn register_action(
-    handle: AnyWindowHandle,
-    path: Option<PathBuf>,
-    error: Option<String>,
-    cx: &mut App,
-) {
-    cx.on_action(move |_: &crate::OpenSettings, cx| {
-        let path = path.clone();
-        let error = error.clone();
-        // Action dispatch already borrows the window; open after it completes.
-        cx.defer(move |cx| {
-            if let Err(error) = cx.update_window(handle, |_, window, cx| {
-                open(path, error, window, cx);
-            }) {
-                eprintln!("Couldn’t open settings: {error}");
-            }
-        });
-    });
-}
+const IDS: [&str; 8] = [
+    "tunnel-name",
+    "ssh-server",
+    "ssh-user",
+    "ssh-port",
+    "identity-file",
+    "local-host",
+    "local-port",
+    "remote-port",
+];
 
-pub(crate) fn show_error(message: String, window: &mut Window, cx: &mut App) {
-    window.open_alert_dialog(cx, move |dialog, _, _| {
-        dialog.title("Couldn’t load settings").description(
-            div()
-                .id("startup-error")
-                .test_support()
-                .role(Role::Status)
-                .aria_label(message.clone())
-                .child(message.clone()),
-        )
-    });
-}
-
-pub(crate) fn open(
-    path: Option<PathBuf>,
-    error: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    // A second shortcut invocation should keep the current draft.
+pub(crate) fn open(path: PathBuf, profile: Option<Profile>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
-    let Some(path) = path else {
-        show_error(
-            error.unwrap_or_else(|| {
-                "Settings saving is disabled. Restart after fixing the settings file.".into()
-            }),
-            window,
-            cx,
-        );
-        return;
-    };
-    let settings = cx.global::<Settings>().clone();
-    let form = cx.new(|cx| SettingsForm::new(path, settings, window, cx));
-    window.open_dialog(cx, move |dialog, window, _| {
+    let editing = profile.is_some();
+    let form = cx.new(|cx| ProfileForm::new(path, profile.unwrap_or_default(), window, cx));
+    window.open_dialog(cx, move |dialog, _, _| {
         let confirm = form.clone();
         dialog
-            .title("Settings")
-            .width(window.rem_size() * 28.)
+            .title(if editing {
+                "Edit tunnel"
+            } else {
+                "New reverse tunnel"
+            })
+            .width(px(620.))
             .child(form.clone())
             .on_ok(move |_, _, cx| confirm.update(cx, |form, cx| form.save(cx)))
     });
 }
 
-struct SettingsForm {
-    path: PathBuf,
-    name: Entity<InputState>,
-    limit: Entity<InputState>,
-    enabled: bool,
-    error: Option<String>,
-    transfer_busy: bool,
-    status: Option<String>,
+pub(crate) fn guide(window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    window.open_dialog(cx, |dialog, _, cx| {
+        dialog.title("A small guide to going backward").width(px(650.))
+            .child(div().flex().flex_col().gap_4().text_sm()
+                .child(guide_step("01   Prepare your SSH server", "Use an SSH server you control. Enable AllowTcpForwarding yes (or remote) in sshd_config, then reload sshd. Public access also requires GatewayPorts clientspecified and an open firewall port."))
+                .child(guide_step("02   Trust the server and load your key", "In a terminal, connect with ssh -F /dev/null -p 22 user@server (use -F NUL on Windows). Verify its fingerprint with your server provider before accepting. Add an encrypted key with ssh-add, or choose a private key in the tunnel form. Password prompts are not supported."))
+                .child(guide_step("03   Map a remote port to your local service", "For a local app on 127.0.0.1:3000, choose remote port 8080. Connect the tunnel, then reach the app at 127.0.0.1:8080 on your SSH server. Enable public access only when you intend to expose the service."))
+                .child(div().p_3().rounded_md().bg(cx.theme().muted).child("OpenSSH 8.0+ must be on PATH. macOS includes it; install openssh-client on Linux or the OpenSSH Client optional feature on Windows. SSH config aliases and jump hosts are not used."))
+                .child(div().text_color(cx.theme().muted_foreground).child("Closing the app stops every tunnel. A connected tunnel confirms the remote listener; your local service must also be running.")))
+            .child(DialogFooter::new().child(Button::new("close-guide").primary().label("Got it").on_click(|_, window, cx| window.close_dialog(cx))))
+    });
 }
 
-impl SettingsForm {
-    fn new(path: PathBuf, settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let name = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("Display name");
-            state.set_value(settings.display_name, window, cx);
-            state
-        });
-        let limit = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("Recent items limit");
-            state.set_value(settings.recent_items_limit.to_string(), window, cx);
-            state
-        });
+fn guide_step(title: &'static str, description: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(description)
+}
+
+struct ProfileForm {
+    path: PathBuf,
+    profile: Profile,
+    inputs: Vec<Entity<InputState>>,
+    error: Option<String>,
+}
+
+impl ProfileForm {
+    fn new(path: PathBuf, profile: Profile, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let values = [
+            profile.name.clone(),
+            profile.server.clone(),
+            profile.user.clone(),
+            profile.ssh_port.to_string(),
+            profile.identity.clone(),
+            profile.local_host.clone(),
+            profile.local_port.to_string(),
+            profile.remote_port.to_string(),
+        ];
+        let placeholders = [
+            "e.g. Development app",
+            "e.g. 203.0.113.10",
+            "e.g. deploy",
+            "22",
+            "Default keys / SSH agent",
+            "127.0.0.1",
+            "3000",
+            "8080",
+        ];
+        let inputs = values
+            .into_iter()
+            .zip(placeholders)
+            .map(|(value, placeholder)| {
+                cx.new(|cx| {
+                    let mut state = InputState::new(window, cx).placeholder(placeholder);
+                    state.set_value(value, window, cx);
+                    state
+                })
+            })
+            .collect();
         Self {
             path,
-            name,
-            limit,
-            enabled: settings.notifications_enabled,
+            profile,
+            inputs,
             error: None,
-            transfer_busy: false,
-            status: None,
         }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.transfer_busy {
-            return false;
-        }
         let result = (|| -> Result<Settings, String> {
-            let limit = self
-                .limit
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| {
-                    "Enter a whole number from 0 to 4294967295 for the recent items limit."
-                        .to_string()
-                })?;
-            let settings = Settings {
-                display_name: self.name.read(cx).value().to_string(),
-                notifications_enabled: self.enabled,
-                recent_items_limit: limit,
+            let values: Vec<String> = self
+                .inputs
+                .iter()
+                .map(|input| input.read(cx).value().trim().to_string())
+                .collect();
+            let port = |i: usize| {
+                values[i]
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p > 0)
+                    .ok_or_else(|| "Ports must be whole numbers from 1 to 65535.".to_string())
             };
-            settings.save(&self.path).map_err(|error| {
-                format!(
-                    "Couldn’t save {}: {error}. Your changes have not been saved.",
-                    self.path.display()
-                )
+            let mut profile = Profile {
+                id: self.profile.id,
+                name: values[0].clone(),
+                server: values[1].clone(),
+                user: values[2].clone(),
+                ssh_port: port(3)?,
+                identity: values[4].clone(),
+                local_host: values[5].clone(),
+                local_port: port(6)?,
+                remote_port: port(7)?,
+                public: self.profile.public,
+            };
+            profile.validate()?;
+            let mut settings = cx.global::<Settings>().clone();
+            if profile.id == 0 {
+                if settings.profiles.len() >= 100 {
+                    return Err(
+                        "You can save up to 100 tunnels. Remove one before adding another.".into(),
+                    );
+                }
+                profile.id = settings
+                    .profiles
+                    .iter()
+                    .map(|p| p.id)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("Tunnel ID limit reached")?;
+                settings.profiles.push(profile);
+            } else {
+                let saved = settings
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.id == profile.id)
+                    .ok_or("This tunnel no longer exists")?;
+                *saved = profile;
+            }
+            settings.save(&self.path).map_err(|e| {
+                format!("Couldn’t save the tunnel: {e}. Your previous profiles are preserved.")
             })?;
             Ok(settings)
         })();
@@ -153,78 +185,38 @@ impl SettingsForm {
         }
     }
 
-    fn transfer(&mut self, importing: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transfer_busy {
-            return;
-        }
-        let picker: Task<Result<Option<PathBuf>>> = if importing {
-            let picker = cx.prompt_for_paths(PathPromptOptions {
-                files: true,
-                directories: false,
-                multiple: false,
-                prompt: Some("Import settings".into()),
-            });
-            cx.background_spawn(async move {
-                Ok(picker.await??.and_then(|paths| paths.into_iter().next()))
-            })
-        } else {
-            let directory = dirs::download_dir()
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| ".".into());
-            let picker = cx.prompt_for_new_path(&directory, Some("settings.json"));
-            cx.background_spawn(async move { picker.await? })
-        };
-        let saved = cx.global::<Settings>().clone();
-        self.transfer_busy = true;
-        self.error = None;
-        self.status = None;
-        cx.notify();
+    fn field(&self, i: usize, label: &'static str) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_sm()
+            .child(label)
+            .child(Input::new(&self.inputs[i]).id(IDS[i]))
+    }
+
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose SSH private key".into()),
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let result: Result<Option<Settings>> = async {
-                let Some(path) = picker.await? else {
-                    return Ok(None);
-                };
-                let settings = cx
-                    .background_spawn(async move {
-                        if importing {
-                            Settings::read(&path)
-                        } else {
-                            saved.save(&path).map(|_| saved)
-                        }
-                    })
-                    .await?;
-                Ok(Some(settings))
-            }
-            .await;
-            let _ = this.update_in(cx, |form, window, cx| {
-                form.transfer_busy = false;
+            let result = picker.await;
+            let _ = this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(Some(settings)) => {
-                        if importing {
-                            form.name.update(cx, |state, cx| {
-                                state.set_value(settings.display_name, window, cx)
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.first() {
+                            this.inputs[4].update(cx, |input, cx| {
+                                input.set_value(path.to_string_lossy().to_string(), window, cx)
                             });
-                            form.limit.update(cx, |state, cx| {
-                                state.set_value(settings.recent_items_limit.to_string(), window, cx)
-                            });
-                            form.enabled = settings.notifications_enabled;
                         }
-                        form.status = Some(
-                            if importing {
-                                "Settings imported. Review them and choose Save."
-                            } else {
-                                "Saved settings exported."
-                            }
-                            .into(),
-                        );
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        form.error = Some(format!(
-                            "Couldn’t {} settings: {error}.",
-                            if importing { "import" } else { "export" }
-                        ))
-                    }
+                    Ok(Ok(None)) => {}
+                    other => this.error = Some(format!("Couldn’t choose a key: {other:?}")),
                 }
                 cx.notify();
             });
@@ -233,104 +225,30 @@ impl SettingsForm {
     }
 }
 
-impl Render for SettingsForm {
+impl Render for ProfileForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                Form::new()
-                    .child(
-                        Field::new()
-                            .label("Display name")
-                            .child(Input::new(&self.name).id("display-name")),
-                    )
-                    .child(
-                        Field::new().label_indent(false).child(
-                            Checkbox::new("notifications-enabled")
-                                .label("Enable notifications")
-                                .checked(self.enabled)
-                                .on_change(cx.listener(|this, value, _, cx| {
-                                    this.enabled = *value;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                    .child(
-                        Field::new()
-                            .label("Recent items limit")
-                            .child(Input::new(&self.limit).id("recent-items-limit")),
-                    ),
-            )
-            .child(
-                div()
-                    .id("settings-transfer-status")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(self.status.clone().unwrap_or_default())
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .children(self.status.clone()),
-            )
-            .child(
-                div()
-                    .id("settings-error")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(self.error.clone().unwrap_or_default())
-                    .text_sm()
-                    .text_color(cx.theme().danger)
-                    .children(self.error.clone()),
-            )
-            .child(
-                DialogFooter::new()
-                    .child(
-                        Button::new("cancel")
-                            .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(DialogAction::new().child(Button::new("save").primary().label("Save"))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_3()
-                    .child(
-                        Button::new("import-settings")
-                            .outline()
-                            .icon(IconName::Upload)
-                            .label("Import settings…")
-                            .disabled(self.transfer_busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.transfer(true, window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("export-settings")
-                            .outline()
-                            .icon(IconName::Download)
-                            .label("Export settings…")
-                            .disabled(self.transfer_busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.transfer(false, window, cx)),
-                            ),
-                    ),
-            )
+        div().flex().flex_col().gap_3()
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Forward a port on your SSH server to a service on this device."))
+            .child(self.field(0, "Tunnel name"))
+            .child(div().flex().gap_3().child(self.field(1, "SSH server")).child(self.field(2, "Username")).child(div().w(px(90.)).child(self.field(3, "SSH port"))))
+            .child(div().flex().items_end().gap_2().child(self.field(4, "Private key (optional)")).child(Button::new("browse-key").outline().label("Browse…").on_click(cx.listener(|this, _, window, cx| this.browse(window, cx)))))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Leave blank to use default keys or your SSH agent. Load encrypted keys with ssh-add."))
+            .child(div().border_t_1().border_color(cx.theme().border).pt_3().flex().gap_3().child(self.field(5, "Local host")).child(self.field(6, "Local port")).child(self.field(7, "Remote port")))
+            .child(Checkbox::new("public-access").label("Allow public access on the SSH server").checked(self.profile.public).on_change(cx.listener(|this, value, _, cx| { this.profile.public = *value; cx.notify(); })))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if self.profile.public { "Exposes your local service to the server’s network. Requires GatewayPorts clientspecified and a firewall rule. Protect the service with authentication." } else { "Private by default: the remote port is accessible only from the SSH server, subject to the server’s GatewayPorts policy." }))
+            .child(div().id("profile-error").test_support().role(Role::Status).aria_label(self.error.clone().unwrap_or_default()).text_sm().text_color(cx.theme().danger).children(self.error.clone()))
+            .child(DialogFooter::new()
+                .child(Button::new("cancel-profile").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(DialogAction::new().child(Button::new("save-profile").primary().label("Save tunnel"))))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{AppView, Assets, OpenSettings, settings::Settings};
+    use super::{Settings, open};
     use gpui_kit::{
-        App, AppContext, AssetSource, KeyBinding, TestAppContext, Window,
-        component::Root,
-        px, size,
-        test::{TestAppContextExt, TestWindowExt},
+        App, AppContext, TestAppContext, Window, component::Root, div, px, size,
+        test::TestWindowExt,
     };
 
     fn fill(window: &mut Window, id: &'static str, value: &str, cx: &mut App) {
@@ -340,156 +258,24 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn settings_dialog_validates_saves_cancels_and_reports_errors(cx: &mut TestAppContext) {
-        for path in [
-            "icons/upload.svg",
-            "icons/download.svg",
-            "icons/settings.svg",
-        ] {
-            assert!(!Assets.load(path).unwrap().unwrap().is_empty());
-            assert!(
-                Assets
-                    .list("icons/")
-                    .unwrap()
-                    .iter()
-                    .any(|name| name.as_ref() == path)
-            );
-        }
-        let directory =
-            std::env::temp_dir().join(format!("base-app-ui-test-{}", std::process::id()));
+    async fn profile_form_validates_saves_and_preserves_on_cancel(cx: &mut TestAppContext) {
+        let directory = std::env::temp_dir().join(format!("portway-ui-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("settings.json");
         Settings::default().save(&path).unwrap();
-        let original = std::fs::read(&path).unwrap();
         cx.update(|cx| {
             gpui_kit::init(cx);
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             cx.set_global(Settings::default());
         });
-        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
-            Root::new(view, window, cx)
-        });
-        cx.update(|cx| {
-            super::register_action(handle.into(), Some(path.clone()), None, cx);
-            cx.bind_keys([KeyBinding::new("cmd-,", OpenSettings, None)]);
+        let handle = cx.open_window(size(px(1000.), px(900.)), |window, cx| {
+            let content = cx.new(|_| Empty);
+            Root::new(content, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
+            open(path.clone(), None, window, cx);
             window.render_frame(cx);
-            window.press("cmd-,", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let import = window.find("import-settings");
-            let export = window.find("export-settings");
-            assert_eq!(import.bounds().top(), export.bounds().top());
-            assert!(import.bounds().top() > window.find("save").bounds().bottom());
-            fill(window, "display-name", "Discarded", cx);
-            window.click("export-settings", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        let backup = directory.join("backup.json");
-        cx.simulate_new_path_selection(|_| Some(backup.clone()));
-        cx.wait_for(
-            handle.into(),
-            std::time::Duration::from_secs(5),
-            |window, _| {
-                window
-                    .find("settings-transfer-status")
-                    .label()
-                    .unwrap()
-                    .contains("exported")
-            },
-        )
-        .await;
-        assert_eq!(Settings::read(&backup).unwrap(), Settings::default());
-        std::fs::write(&backup, r#"{"recent_items_limit":-1}"#).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("import-settings", cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.simulate_path_prompt_response(|options| {
-            assert!(options.files && !options.directories && !options.multiple);
-            Some(vec![backup.clone()])
-        });
-        cx.wait_for(
-            handle.into(),
-            std::time::Duration::from_secs(5),
-            |window, _| {
-                window
-                    .find("settings-error")
-                    .label()
-                    .unwrap()
-                    .contains("Couldn’t import")
-            },
-        )
-        .await;
-        cx.update_window(handle.into(), |_, window, _| {
-            assert_eq!(window.find("display-name").value(), Some("Discarded"));
-        })
-        .unwrap();
-        let imported = Settings {
-            display_name: "Imported".into(),
-            notifications_enabled: false,
-            recent_items_limit: 5,
-        };
-        imported.save(&backup).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("import-settings", cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.simulate_path_prompt_response(|_| Some(vec![backup.clone()]));
-        cx.wait_for(
-            handle.into(),
-            std::time::Duration::from_secs(5),
-            |window, _| {
-                window
-                    .find("settings-transfer-status")
-                    .label()
-                    .unwrap()
-                    .contains("imported")
-            },
-        )
-        .await;
-        cx.update_window(handle.into(), |_, window, cx| {
-            assert_eq!(window.find("display-name").value(), Some("Imported"));
-            assert_eq!(window.find("recent-items-limit").value(), Some("5"));
-            assert_eq!(window.find("notifications-enabled").checked(), Some(false));
-            assert_eq!(cx.global::<Settings>(), &Settings::default());
-            assert_eq!(std::fs::read(&path).unwrap(), original);
-            window.click("import-settings", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.simulate_path_prompt_response(|_| None);
-        cx.wait_for(
-            handle.into(),
-            std::time::Duration::from_secs(5),
-            |window, _| window.find("import-settings").disabled() != Some(true),
-        )
-        .await;
-        cx.update_window(handle.into(), |_, window, cx| {
-            assert_eq!(window.find("display-name").value(), Some("Imported"));
-            window.press("escape", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_action(Box::new(OpenSettings), cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            fill(window, "display-name", "Ada", cx);
-            window.click("notifications-enabled", cx);
-            fill(window, "recent-items-limit", "-1", cx);
-            window.click("save", cx);
+            window.click("save-profile", cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -497,16 +283,16 @@ mod tests {
             window.render_frame(cx);
             assert!(
                 window
-                    .find("settings-error")
+                    .find("profile-error")
                     .label()
                     .unwrap()
-                    .contains("whole number")
+                    .contains("name")
             );
-            assert_eq!(cx.global::<Settings>(), &Settings::default());
-            fill(window, "recent-items-limit", "3", cx);
-            std::fs::create_dir(path.with_extension(format!("{}.tmp", std::process::id())))
-                .unwrap();
-            window.click("save", cx);
+            fill(window, "tunnel-name", "Development", cx);
+            fill(window, "ssh-server", "example.com", cx);
+            fill(window, "ssh-user", "deploy", cx);
+            fill(window, "remote-port", "70000", cx);
+            window.click("save-profile", cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -514,49 +300,39 @@ mod tests {
             window.render_frame(cx);
             assert!(
                 window
-                    .find("settings-error")
+                    .find("profile-error")
                     .label()
                     .unwrap()
-                    .contains("Couldn’t save")
+                    .contains("65535")
             );
-            assert_eq!(cx.global::<Settings>(), &Settings::default());
-            assert_eq!(std::fs::read(&path).unwrap(), original);
-            std::fs::remove_dir(path.with_extension(format!("{}.tmp", std::process::id())))
-                .unwrap();
-            window.press("enter", cx);
+            fill(window, "remote-port", "8080", cx);
+            window.click("save-profile", cx);
         })
         .unwrap();
         cx.run_until_parked();
-        let saved = Settings::load(&path).unwrap();
-        assert_eq!(saved.display_name, "Ada");
-        assert!(!saved.notifications_enabled);
-        assert_eq!(saved.recent_items_limit, 3);
+        let saved = Settings::read(&path).unwrap();
+        assert_eq!(saved.profiles.len(), 1);
+        assert_eq!(saved.profiles[0].name, "Development");
         cx.update_window(handle.into(), |_, window, cx| {
+            open(path.clone(), Some(saved.profiles[0].clone()), window, cx);
             window.render_frame(cx);
-            assert!(window.try_find("save").is_none());
-            assert_eq!(cx.global::<Settings>(), &saved);
-            super::open(
-                None,
-                Some("Fix settings.json, then restart.".into()),
-                window,
-                cx,
-            );
+            fill(window, "tunnel-name", "Discarded", cx);
+            window.click("cancel-profile", cx);
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find("display-name").is_none());
-            assert!(window.try_find("ok").is_some());
-            assert!(
-                window
-                    .find("startup-error")
-                    .label()
-                    .unwrap()
-                    .contains("Fix settings.json")
-            );
-        })
-        .unwrap();
+        assert_eq!(Settings::read(&path).unwrap(), saved);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    struct Empty;
+    impl gpui_kit::Render for Empty {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            div()
+        }
     }
 }

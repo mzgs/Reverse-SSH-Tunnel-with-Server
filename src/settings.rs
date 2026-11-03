@@ -7,23 +7,10 @@ use std::{
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
-    // Replace these examples with your app's settings.
-    pub(crate) display_name: String,
-    pub(crate) notifications_enabled: bool,
-    pub(crate) recent_items_limit: u32,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            display_name: "Guest".into(),
-            notifications_enabled: true,
-            recent_items_limit: 10,
-        }
-    }
+    pub(crate) profiles: Vec<crate::tunnel::Profile>,
 }
 
 impl Settings {
@@ -46,7 +33,26 @@ impl Settings {
     }
 
     pub(crate) fn read(path: &Path) -> io::Result<Self> {
-        read_json(path)
+        let settings: Self = read_json(path)?;
+        if settings.profiles.len() > 100 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "At most 100 tunnel profiles are supported",
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for profile in &settings.profiles {
+            profile
+                .validate()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if profile.id == 0 || !ids.insert(profile.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid or duplicate tunnel profile ID",
+                ));
+            }
+        }
+        Ok(settings)
     }
 
     pub(crate) fn save(&self, path: &Path) -> io::Result<()> {
@@ -128,20 +134,20 @@ mod tests {
             let missing = directory.join("missing.json");
             assert!(Settings::read(&missing).is_err());
             assert!(!missing.exists());
-            settings.display_name = "Ada".into();
-            settings.notifications_enabled = false;
-            settings.recent_items_limit = 3;
+            settings.profiles.push(crate::tunnel::Profile {
+                id: 1,
+                name: "Development".into(),
+                server: "example.com".into(),
+                user: "deploy".into(),
+                ..crate::tunnel::Profile::default()
+            });
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?, settings);
+            // Old scaffold preferences still load without discarding the file on error.
             fs::write(&path, r#"{"display_name":"Lin"}"#)?;
-            assert_eq!(
-                Settings::load(&path)?,
-                Settings {
-                    display_name: "Lin".into(),
-                    ..Settings::default()
-                }
-            );
-            for invalid in ["invalid JSON", r#"{"recent_items_limit":-1}"#] {
+            assert_eq!(Settings::load(&path)?, Settings::default());
+            let invalid = r#"{"profiles":[{"id":1}]}"#;
+            for invalid in ["invalid JSON", invalid] {
                 fs::write(&path, invalid)?;
                 assert!(Settings::load(&path).is_err());
                 assert_eq!(fs::read_to_string(&path)?, invalid);
@@ -152,16 +158,12 @@ mod tests {
                 Settings::read(&oversized).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
-            let huge = Settings {
-                display_name: "x".repeat(MAX_SETTINGS_BYTES),
-                ..Settings::default()
-            };
-            assert!(huge.save(&path).is_err());
-            assert_eq!(fs::read_to_string(&path)?, r#"{"recent_items_limit":-1}"#);
+            assert!(write_json(&path, &"x".repeat(MAX_SETTINGS_BYTES)).is_err());
+            assert_eq!(fs::read_to_string(&path)?, invalid);
             let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
             fs::write(&temporary, "existing temporary file")?;
             assert!(settings.save(&path).is_err());
-            assert_eq!(fs::read_to_string(&path)?, r#"{"recent_items_limit":-1}"#);
+            assert_eq!(fs::read_to_string(&path)?, invalid);
             assert_eq!(fs::read_to_string(&temporary)?, "existing temporary file");
             assert!(
                 Settings::path()?

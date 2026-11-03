@@ -1,0 +1,555 @@
+use crate::{
+    settings::Settings,
+    settings_view,
+    tunnel::{Profile, Session, Status},
+};
+use gpui_kit::{
+    assets::IconName,
+    component::{
+        ActiveTheme, Disableable, Icon, Sizable, WindowExt,
+        button::{Button, ButtonCustomVariant, ButtonVariants},
+    },
+    prelude::FluentBuilder,
+    *,
+};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
+
+const INK: u32 = 0xf0f0f2;
+const MUTED: u32 = 0xa7a7b1;
+const LINE: u32 = 0x35353d;
+const ACCENT: u32 = 0xa4b5ff;
+
+pub(crate) struct TunnelView {
+    path: Option<PathBuf>,
+    selected: Option<u64>,
+    sessions: HashMap<u64, Session>,
+    error: Option<String>,
+    log_scroll: ScrollHandle,
+}
+
+impl TunnelView {
+    pub fn new(path: Option<PathBuf>, error: Option<String>, cx: &mut Context<Self>) -> Self {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let mut changed = this.sessions.values().any(Session::active);
+                        let selected = this
+                            .selected
+                            .or_else(|| cx.global::<Settings>().profiles.last().map(|p| p.id));
+                        // The stderr reader can deliver final diagnostics after the process exits.
+                        for (id, session) in &mut this.sessions {
+                            let previous = session.logs.back().cloned();
+                            session.poll();
+                            if session.logs.back() != previous.as_ref() {
+                                changed = true;
+                                if Some(*id) == selected {
+                                    this.log_scroll.scroll_to_bottom();
+                                }
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Self {
+            path,
+            selected: None,
+            sessions: HashMap::new(),
+            error,
+            log_scroll: ScrollHandle::new(),
+        }
+    }
+
+    pub fn stop_all(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.stop();
+        }
+    }
+
+    fn edit(&self, profile: Option<Profile>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = &self.path {
+            settings_view::open(path.clone(), profile, window, cx);
+        }
+    }
+
+    fn toggle(&mut self, profile: &Profile, cx: &mut Context<Self>) {
+        self.error = None;
+        if let Some(session) = self.sessions.get_mut(&profile.id).filter(|s| s.active()) {
+            session.stop();
+        } else {
+            match Session::start(profile) {
+                Ok(session) => {
+                    self.sessions.insert(profile.id, session);
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+        cx.notify();
+    }
+
+    fn delete(&self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let weak = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let profile = profile.clone();
+            let path = path.clone();
+            let weak = weak.clone();
+            dialog
+                .title("Delete tunnel?")
+                .description(format!(
+                    "Remove “{}” from your saved tunnels? Your SSH keys and server are kept.",
+                    profile.name
+                ))
+                .on_ok(move |_, _, cx| {
+                    let mut settings = cx.global::<Settings>().clone();
+                    settings.profiles.retain(|p| p.id != profile.id);
+                    match settings.save(&path) {
+                        Ok(()) => {
+                            cx.set_global(settings);
+                            let _ = weak.update(cx, |this, cx| {
+                                this.sessions.remove(&profile.id);
+                                this.selected = None;
+                                cx.notify();
+                            });
+                            cx.refresh_windows();
+                            true
+                        }
+                        Err(error) => {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.error = Some(format!("Couldn’t delete tunnel: {error}"));
+                                cx.notify();
+                            });
+                            false
+                        }
+                    }
+                })
+        });
+    }
+
+    fn status(&self, id: u64) -> Status {
+        self.sessions
+            .get(&id)
+            .map(|s| s.status)
+            .unwrap_or(Status::Stopped)
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(218.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(0x101013))
+            .text_color(rgb(0xf0f0f2))
+            .flex()
+            .flex_col()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .pt_3()
+                    .pb_8()
+                    .child(
+                        div()
+                            .size(px(34.))
+                            .rounded_lg()
+                            .bg(rgb(0xdce4ff))
+                            .text_color(rgb(0x263b80))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::Waypoints).size_5()),
+                    )
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Portway"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x93939f))
+                    .mb_3()
+                    .child("WORKSPACE"),
+            )
+            .child(
+                Button::new("tunnels-nav")
+                    .w_full()
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(rgb(0x2d3040).into())
+                            .foreground(rgb(0xe0e6ff).into())
+                            .hover(rgb(0x383d50).into()),
+                    )
+                    .icon(IconName::Waypoints)
+                    .label("Reverse tunnels")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div().mt_2().child(
+                    Button::new("connection-guide")
+                        .w_full()
+                        .ghost()
+                        .text_color(rgb(0xb1b1bc))
+                        .icon(IconName::BookOpen)
+                        .label("Connection guide")
+                        .on_click(|_, window, cx| settings_view::guide(window, cx)),
+                ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x35353d))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .child(
+                                Icon::new(IconName::ShieldCheck)
+                                    .size_4()
+                                    .text_color(rgb(0xdce4ff)),
+                            )
+                            .child("Your keys stay yours"),
+                    )
+                    .child(div().text_xs().text_color(rgb(0xa7a7b1)).child(
+                        "Powered by OpenSSH. No passwords or private keys are stored in Portway.",
+                    )),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .text_xs()
+                    .text_color(rgb(0x93939f))
+                    .child("LOCAL WORKSPACE   /   v0.1.0"),
+            )
+    }
+
+    fn empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        card().flex_1().flex().flex_col().items_center().justify_center().gap_5().p_8()
+            .child(div().size(px(70.)).rounded_2xl().bg(rgb(0x292e43)).flex().items_center().justify_center().text_color(rgb(ACCENT)).child(Icon::new(IconName::Waypoints).size(px(32.))))
+            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Your local world, within reach."))
+            .child(div().max_w(px(470.)).text_center().text_color(rgb(MUTED)).child("Bring a local app, development server, or device to your SSH server through an encrypted reverse tunnel."))
+            .child(Button::new("create-first").primary().icon(IconName::Plus).label("Create your first tunnel").disabled(self.path.is_none()).on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx))))
+            .child(div().mt_6().flex().gap_8()
+                .child(step("01", "Add your SSH server"))
+                .child(step("02", "Choose your ports"))
+                .child(step("03", "Connect securely")))
+            .child(div().text_xs().text_color(rgb(MUTED)).child("macOS  ·  Windows  ·  Linux"))
+    }
+
+    fn profile_list(
+        &self,
+        profiles: &[Profile],
+        selected: u64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        card()
+            .w(px(265.))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .p_4()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("SAVED TUNNELS"),
+            )
+            .child(
+                div()
+                    .id("profile-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(profiles.iter().map(|p| {
+                        let id = p.id;
+                        let active = id == selected;
+                        let status = self.status(id);
+                        div()
+                            .rounded_lg()
+                            .p_3()
+                            .bg(rgb(if active { 0x2b3044 } else { 0x1c1c21 }))
+                            .child(
+                                Button::new(SharedString::from(format!("profile-{id}")))
+                                    .w_full()
+                                    .ghost()
+                                    .label(p.name.clone())
+                                    .icon(IconName::Terminal)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.selected = Some(id);
+                                        this.log_scroll.scroll_to_bottom();
+                                        this.error = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .justify_between()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{} → {}", p.remote_port, p.local_port))
+                                    .child(status_badge(status)),
+                            )
+                    })),
+            )
+    }
+
+    fn details(&self, profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = self.status(profile.id);
+        let session = self.sessions.get(&profile.id);
+        let active = session.is_some_and(Session::active);
+        let edit = profile.clone();
+        let connect = profile.clone();
+        let delete = profile.clone();
+        let uptime = session
+            .and_then(|s| s.connected_at)
+            .filter(|_| status == Status::Connected)
+            .map(|t| {
+                let seconds = t.elapsed().as_secs();
+                format!("{}m {:02}s", seconds / 60, seconds % 60)
+            })
+            .unwrap_or_else(|| "—".into());
+        div().flex_1().min_w_0().h_full().flex().flex_col().gap_3()
+            .child(card().p_4().flex().flex_col().gap_3()
+                .child(div().flex().items_center().justify_between().gap_3()
+                    .child(div().min_w_0().flex().flex_col().gap_1().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(profile.name.clone())).child(div().text_xs().text_color(rgb(MUTED)).truncate().child(format!("{}@{}:{} · {}", profile.user, profile.server, profile.ssh_port, if profile.identity.is_empty() { "SSH agent / default keys" } else { "Private key" }))))
+                    .child(div().flex().gap_2()
+                        .child(Button::new("edit-tunnel").ghost().icon(IconName::Pencil).label("Edit").tooltip("Edit tunnel").disabled(active || self.path.is_none()).on_click(cx.listener(move |this, _, window, cx| this.edit(Some(edit.clone()), window, cx))))
+                        .child(Button::new("connect-tunnel").primary().icon(if active { IconName::Square } else { IconName::Play }).label(if active { "Disconnect" } else { "Connect" }).on_click(cx.listener(move |this, _, _, cx| this.toggle(&connect, cx))))))
+                .child(div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(0x17171c)).p_3().flex().items_center().gap_3()
+                    .child(endpoint(IconName::Server, "REMOTE SERVER", format!("{}:{}", profile.remote_bind(), profile.remote_port), profile.server.clone()))
+                    .child(div().flex_1().min_w(px(34.)).text_center().text_color(rgb(ACCENT)).child(Icon::new(IconName::ArrowRight).size_5()))
+                    .child(endpoint(IconName::Laptop, "LOCAL SERVICE", format!("{}:{}", profile.local_host, profile.local_port), "This device".into())))
+                .child(div().flex().items_center().justify_between().text_xs().border_t_1().border_color(rgb(LINE)).pt_3()
+                    .child(div().flex().gap_3().child(status_badge(status)).child(format!("Uptime {uptime}")))
+                    .child(div().text_color(rgb(MUTED)).child(if profile.public { "Public access requested · 0.0.0.0" } else { "Private access requested · 127.0.0.1" }))))
+            .child(card().flex_1().min_h(px(145.)).flex().flex_col().overflow_hidden()
+                .child(div().px_4().py_2().flex().items_center().justify_between().border_b_1().border_color(rgb(LINE))
+                    .child(div().flex().items_center().gap_2().text_sm().font_weight(FontWeight::MEDIUM).child(Icon::new(IconName::Terminal).size_4()).child("Connection log"))
+                    .child(Button::new("copy-log").ghost().small().icon(IconName::Copy).label("Copy").disabled(session.is_none()).on_click({
+                        let text = session.map(|s| s.logs.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                    })))
+                .child(div().id("connection-log").track_scroll(&self.log_scroll).test_support().role(Role::Log).aria_label(session.map(|s| format!("SSH connection log. {}", s.logs.iter().cloned().collect::<Vec<_>>().join("\n"))).unwrap_or_else(|| "SSH connection log. Connect to see output.".into())).flex_1().min_h_0().overflow_y_scroll().p_4().bg(rgb(0x121216)).text_color(rgb(0xc9c9d2)).text_xs().font_family(cx.theme().mono_font_family.clone()).flex().flex_col().gap_1()
+                    .children(if let Some(session) = session { session.logs.iter().map(|s| div().child(s.clone()).into_any_element()).collect::<Vec<_>>() } else { vec![div().text_color(rgb(0x9d9daa)).child("Ready when you are. Connect to see OpenSSH output here.").into_any_element()] })))
+            .child(div().flex().items_center().justify_between().text_xs().text_color(rgb(MUTED))
+                .child("Logs stay in memory · Last 200 lines")
+                .child(Button::new("delete-tunnel").ghost().small().icon(IconName::Trash).label("Delete tunnel").disabled(active || self.path.is_none()).on_click(cx.listener(move |this, _, window, cx| this.delete(delete.clone(), window, cx)))))
+    }
+}
+
+impl Render for TunnelView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let profiles = cx.global::<Settings>().profiles.clone();
+        let selected = self
+            .selected
+            .and_then(|id| profiles.iter().find(|p| p.id == id))
+            .or_else(|| profiles.last());
+        let connected = self
+            .sessions
+            .values()
+            .filter(|s| s.status == Status::Connected)
+            .count();
+        div().size_full().flex().bg(rgb(0x131316)).text_color(rgb(INK))
+            .child(self.sidebar(cx))
+            .child(div().flex_1().min_w_0().h_full().flex().flex_col()
+                .child(div().h(px(55.)).flex_shrink_0().px_7().border_b_1().border_color(rgb(LINE)).flex().items_center().justify_between().bg(rgb(0x1c1c21))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("Workspace   /   Reverse tunnels"))
+                    .child(div().flex().items_center().gap_2().text_xs().text_color(rgb(MUTED)).child(div().size(px(6.)).rounded_full().bg(rgb(ACCENT))).child("ON THIS DEVICE")))
+                .child(div().id("workspace").flex_1().min_h_0().overflow_y_scroll().p_7().flex().flex_col().gap_5()
+                    .child(div().flex().items_center().justify_between().gap_4()
+                        .child(div().flex().flex_col().gap_1().child(div().text_3xl().font_weight(FontWeight::SEMIBOLD).child("Reverse tunnels")).child(div().text_sm().text_color(rgb(MUTED)).child("A secure path back to your local services.")))
+                        .child(Button::new("new-tunnel").primary().icon(IconName::Plus).label("New tunnel").disabled(self.path.is_none()).on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)))))
+                    .children(self.error.clone().map(|error| div().id("tunnel-error").test_support().role(Role::Alert).aria_label(error.clone()).rounded_md().border_1().border_color(rgb(0x76533e)).bg(rgb(0x33251e)).p_3().text_sm().text_color(rgb(0xf1b99b)).child(error)))
+                    .child(div().flex().gap_4()
+                        .child(metric("SAVED TUNNELS", profiles.len().to_string(), "Ready for your next connection", IconName::Waypoints))
+                        .child(metric("CONNECTED", connected.to_string(), "Remote forwarding confirmed", IconName::Activity))
+                        .child(metric("BUILT ON OPENSSH", "End-to-end".into(), "Encrypted between this device and server", IconName::ShieldCheck)))
+                    .child(div().flex_1().min_h(px(410.)).flex().gap_4().map(|element| {
+                        if let Some(profile) = selected {
+                            element.child(self.profile_list(&profiles, profile.id, cx)).child(self.details(profile, cx))
+                        } else { element.child(self.empty(cx)) }
+                    }))
+                    .child(div().text_xs().text_color(rgb(MUTED)).flex().items_center().gap_2().child(Icon::new(IconName::Info).size_4()).child("Tunnels run while Portway is open. Closing the app disconnects every tunnel."))))
+    }
+}
+
+fn card() -> Div {
+    div()
+        .bg(rgb(0x1c1c21))
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(LINE))
+}
+
+fn metric(
+    label: &'static str,
+    value: String,
+    caption: &'static str,
+    icon: IconName,
+) -> impl IntoElement {
+    card()
+        .flex_1()
+        .min_w_0()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(label)
+                .child(Icon::new(icon).size_4()),
+        )
+        .child(
+            div()
+                .text_2xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(value),
+        )
+        .child(div().text_xs().text_color(rgb(MUTED)).child(caption))
+}
+fn step(n: &'static str, text: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .child(
+            div()
+                .text_color(rgb(ACCENT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(n),
+        )
+        .child(text)
+}
+fn endpoint(
+    icon: IconName,
+    label: &'static str,
+    address: String,
+    caption: String,
+) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(Icon::new(icon).size_4())
+                .child(label),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(address),
+        )
+        .child(div().text_xs().text_color(rgb(MUTED)).child(caption))
+}
+fn status_badge(status: Status) -> impl IntoElement {
+    let color = match status {
+        Status::Connected => ACCENT,
+        Status::Connecting => 0xf1cc83,
+        Status::Stopped => MUTED,
+        Status::Failed => 0xffa99a,
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .text_color(rgb(color))
+        .child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+        .child(status.label())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TunnelView;
+    use crate::{settings::Settings, tunnel::Profile};
+    use gpui_kit::{AppContext, TestAppContext, component::Root, px, size, test::TestWindowExt};
+
+    #[gpui_kit::test]
+    async fn dashboard_keeps_connection_log_visible(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            cx.set_global(Settings {
+                profiles: vec![Profile {
+                    id: 1,
+                    name: "Local development".into(),
+                    server: "example.com".into(),
+                    user: "deploy".into(),
+                    ..Profile::default()
+                }],
+            });
+        });
+        let handle = cx.open_window(size(px(1200.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| TunnelView::new(None, None, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let log = window.find("connection-log").bounds();
+            assert!(
+                log.size.height >= px(90.),
+                "Connection log collapsed: {log:?}"
+            );
+            assert!(
+                log.bottom() < px(800.),
+                "Connection log extends past the window: {log:?}"
+            );
+        })
+        .unwrap();
+    }
+}

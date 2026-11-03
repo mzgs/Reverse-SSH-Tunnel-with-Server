@@ -1,13 +1,36 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod settings;
 mod settings_view;
+mod tunnel;
+mod tunnel_view;
 mod window_state;
 
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
 
-gpui_kit::assets::icon_assets!(SettingsIcons, [Upload, Download]);
+gpui_kit::assets::icon_assets!(
+    SettingsIcons,
+    [
+        Waypoints,
+        BookOpen,
+        ShieldCheck,
+        Plus,
+        Terminal,
+        Server,
+        Laptop,
+        ArrowRight,
+        Pencil,
+        Play,
+        Square,
+        Copy,
+        Trash,
+        Activity,
+        Info
+    ]
+);
 
 struct Assets;
 
@@ -35,12 +58,15 @@ actions!(base_app, [Quit, OpenSettings]);
 struct AppView {
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
+    tunnels: Entity<tunnel_view::TunnelView>,
 }
 
 impl AppView {
     fn new(
         window_path: Option<std::path::PathBuf>,
         restored: Option<WindowState>,
+        settings_path: Option<std::path::PathBuf>,
+        startup_error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -48,22 +74,26 @@ impl AppView {
         window_state.update(window);
         cx.observe_window_bounds(window, |view, window, _| view.window_state.update(window))
             .detach();
-        cx.on_app_quit(|view, _| {
+        cx.on_app_quit(|view, cx| {
             view.save_window_state();
+            view.tunnels.update(cx, |tunnels, _| tunnels.stop_all());
             async {}
         })
         .detach();
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = weak.update(cx, |view, _| {
+            let _ = weak.update(cx, |view, cx| {
                 view.window_state.update(window);
                 view.save_window_state();
+                view.tunnels.update(cx, |tunnels, _| tunnels.stop_all());
             });
             true
         });
+        let tunnels = cx.new(|cx| tunnel_view::TunnelView::new(settings_path, startup_error, cx));
         Self {
             window_path,
             window_state,
+            tunnels,
         }
     }
 
@@ -80,8 +110,8 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(cx.theme().background)
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.tunnels.clone())
     }
 }
 
@@ -141,20 +171,33 @@ fn main() {
 
         let options = WindowOptions {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
+            window_min_size: Some(size(px(1100.), px(760.))),
             titlebar: Some(TitlebarOptions {
-                title: Some(env!("CARGO_PKG_NAME").into()),
+                title: Some("Portway — Reverse SSH tunnels".into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
-            window
-                .observe_window_appearance(|window, cx| {
-                    Theme::sync_system_appearance(Some(window), cx);
-                })
-                .detach();
-            cx.new(|cx| AppView::new(window_path, restored, window, cx))
+            Theme::change(ThemeMode::Dark, Some(window), cx);
+            Theme::update(cx, |theme| {
+                theme.colors.primary = rgb(0x127657).into();
+                theme.colors.button_primary = rgb(0x127657).into();
+                theme.colors.button_primary_hover = rgb(0x0c6147).into();
+                theme.colors.button_primary_active = rgb(0x094d38).into();
+                theme.colors.button_primary_foreground = rgb(0xffffff).into();
+                theme.colors.ring = rgb(0x8edbb2).into();
+            });
+            cx.new(|cx| {
+                AppView::new(
+                    window_path,
+                    restored,
+                    settings_path,
+                    startup_error,
+                    window,
+                    cx,
+                )
+            })
         })
         .expect("Failed to open app window");
         window_handle.set(Some(handle));
@@ -167,21 +210,20 @@ fn main() {
             KeyBinding::new("ctrl-,", OpenSettings, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        settings_view::register_action(handle, settings_path, startup_error.clone(), cx);
+        cx.on_action(move |_: &OpenSettings, cx| {
+            cx.defer(move |cx| {
+                let _ = cx.update_window(handle, |_, window, cx| settings_view::guide(window, cx));
+            });
+        });
         cx.set_menus(vec![Menu {
-            name: env!("CARGO_PKG_NAME").into(),
+            name: "Portway".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Connection guide…", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Quit", Quit),
             ],
         }]);
-        if let Some(error) = startup_error {
-            let _ = cx.update_window(handle, |_, window, cx| {
-                settings_view::show_error(error, window, cx);
-            });
-        }
         cx.activate(true);
     });
 }

@@ -4,12 +4,13 @@ cd "$(dirname "$0")"
 app_name="reverse-ssh-tunnel-with-server"
 
 if [ "$(uname -s)" != Darwin ]; then
-    printf '%s\n' 'build.sh requires macOS to create an .app bundle.' >&2
-    exit 1
+    cargo build --release --locked
+    printf 'Built target/release/%s\n' "$app_name"
+    exit 0
 fi
 
 host=$(rustup run stable rustc -vV | sed -n 's/^host: //p')
-rustup run stable cargo build --release --target "$host" --target-dir target
+rustup run stable cargo build --release --locked --target "$host" --target-dir target
 
 bundle="target/release/$app_name.app"
 identifier="local.$(printf '%s' "$app_name" | tr '_' '-')"
@@ -20,8 +21,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>$app_name</string>
-<key>CFBundleDisplayName</key><string>$app_name</string>
+<key>CFBundleName</key><string>Portway</string>
+<key>CFBundleDisplayName</key><string>Portway</string>
 <key>CFBundleIdentifier</key><string>$identifier</string>
 <key>CFBundleExecutable</key><string>$app_name</string>
 <key>CFBundlePackageType</key><string>APPL</string>
