@@ -348,7 +348,7 @@ impl TunnelView {
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("{} → {}", p.remote_port, p.local_port))
-                                            .child(status_badge(self.status(id))),
+                                            .child(status_badge(self.status(id), cx)),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -388,7 +388,7 @@ impl TunnelView {
                     .child(div().flex_1().min_w(px(34.)).text_center().text_color(rgb(ACCENT)).child(Icon::new(IconName::ArrowRight).size_5()))
                     .child(endpoint(IconName::Laptop, "LOCAL SERVICE", format!("{}:{}", profile.local_host, profile.local_port), "This device".into())))
                 .child(div().flex().items_center().justify_between().text_xs().border_t_1().border_color(rgb(LINE)).pt_3()
-                    .child(div().flex().gap_3().child(status_badge(status)).child(format!("Uptime {uptime}")))
+                    .child(div().flex().gap_3().child(status_badge(status, cx)).child(format!("Uptime {uptime}")))
                     .child(div().text_color(rgb(MUTED)).child(if profile.public { "Public access requested · 0.0.0.0" } else { "Private access requested · 127.0.0.1" }))))
             .child(card().flex_1().min_h(px(145.)).flex().flex_col().overflow_hidden()
                 .child(div().px_4().py_2().flex().items_center().justify_between().border_b_1().border_color(rgb(LINE))
@@ -482,20 +482,20 @@ fn endpoint(
         )
         .child(div().text_xs().text_color(rgb(MUTED)).child(caption))
 }
-fn status_badge(status: Status) -> impl IntoElement {
+fn status_badge(status: Status, cx: &App) -> impl IntoElement {
     let color = match status {
-        Status::Connected => ACCENT,
-        Status::Connecting => 0xf1cc83,
-        Status::Stopped => MUTED,
-        Status::Failed => 0xffa99a,
+        Status::Connected => cx.theme().success,
+        Status::Connecting => rgb(0xf1cc83).into(),
+        Status::Stopped => rgb(MUTED).into(),
+        Status::Failed => rgb(0xffa99a).into(),
     };
     div()
         .flex()
         .items_center()
         .gap_2()
         .text_xs()
-        .text_color(rgb(color))
-        .child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+        .text_color(color)
+        .child(div().size(px(6.)).rounded_full().bg(color))
         .child(status.label())
 }
 
