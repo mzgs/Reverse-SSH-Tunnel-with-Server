@@ -26,7 +26,7 @@ cargo run --locked
 
   `./build.sh` or `cargo build --release --locked` creates `target/release/reverse-ssh-tunnel-with-server`.
 
-The repository's existing GPUI Kit revision and dependencies are retained. CI checks all three operating systems; local validation is on macOS.
+GPUI Kit is pinned to version 0.9.0 (revision `0ab9cf4e`), using GPUI Fast 0.1.13. CI checks all three operating systems; local validation is on macOS.
 
 ## First connection
 
@@ -49,7 +49,7 @@ For access from other machines, explicitly enable **Allow public access**, confi
 - A tunnel becomes **Connected** only after OpenSSH confirms the remote forwarding request. This does not test the availability of your local service or a public firewall rule.
 - Keepalives detect a lost server connection. Failures remain visible in the log; reconnect manually. Closing or quitting the app stops and reaps its SSH child processes. Forced process termination or an OS crash can bypass cleanup.
 - Only key/default-key/agent authentication is supported. No password storage, SSH agent forwarding, automatic reconnect, jump hosts, SSH config aliases, background service, or server provisioning. Portway ignores user SSH config to avoid implicit forwards, proxy commands, and detached processes.
-- Logs are held in memory, capped at 200 lines per tunnel, and can be copied. They may contain usernames, hostnames, and key paths; review before sharing.
+- Logs are held in memory, capped at 200 lines per tunnel, and support text selection and copying. They may contain usernames, hostnames, and key paths; review before sharing.
 - Profiles store connection details and key **paths**, never key contents, in `settings.json` under the platform's local app-data directory named `reverse-ssh-tunnel-with-server`. Window geometry is stored alongside it. Invalid files are preserved and saving is disabled with an error message. Up to 100 profiles are supported.
 
 ## Check

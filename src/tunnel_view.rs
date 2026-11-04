@@ -5,6 +5,7 @@ use crate::{
 };
 use gpui_kit::{
     assets::IconName,
+    base::SelectableText,
     component::{
         ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonVariants},
@@ -364,6 +365,9 @@ impl TunnelView {
     fn details(&self, profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.status(profile.id);
         let session = self.sessions.get(&profile.id);
+        let log_text = session
+            .map(|s| s.logs.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_else(|| "Ready when you are. Connect to see OpenSSH output here.".into());
         let active = session.is_some_and(Session::active);
         let edit = profile.clone();
         let connect = profile.clone();
@@ -376,32 +380,235 @@ impl TunnelView {
                 format!("{}m {:02}s", seconds / 60, seconds % 60)
             })
             .unwrap_or_else(|| "—".into());
-        div().id("connection-details").test_support().aria_label(profile.name.clone()).flex_1().min_w_0().h_full().flex().flex_col().gap_3()
-            .child(card().p_4().flex().flex_col().gap_3()
-                .child(div().flex().items_center().justify_between().gap_3()
-                    .child(div().min_w_0().flex().flex_col().gap_1().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(profile.name.clone())).child(div().text_xs().text_color(rgb(MUTED)).truncate().child(format!("{}@{}:{} · {}", profile.user, profile.server, profile.ssh_port, if profile.identity.is_empty() { "SSH agent / default keys" } else { "Private key" }))))
-                    .child(div().flex().gap_2()
-                        .child(Button::new("edit-tunnel").ghost().icon(IconName::Pencil).label("Edit").tooltip("Edit tunnel").disabled(active || self.path.is_none()).on_click(cx.listener(move |this, _, window, cx| this.edit(Some(edit.clone()), window, cx))))
-                        .child(Button::new("connect-tunnel").primary().icon(if active { IconName::Square } else { IconName::Play }).label(if active { "Disconnect" } else { "Connect" }).on_click(cx.listener(move |this, _, _, cx| this.toggle(&connect, cx))))))
-                .child(div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(0x17171c)).p_3().flex().items_center().gap_3()
-                    .child(endpoint(IconName::Server, "REMOTE SERVER", format!("{}:{}", profile.remote_bind(), profile.remote_port), profile.server.clone()))
-                    .child(div().flex_1().min_w(px(34.)).text_center().text_color(rgb(ACCENT)).child(Icon::new(IconName::ArrowRight).size_5()))
-                    .child(endpoint(IconName::Laptop, "LOCAL SERVICE", format!("{}:{}", profile.local_host, profile.local_port), "This device".into())))
-                .child(div().flex().items_center().justify_between().text_xs().border_t_1().border_color(rgb(LINE)).pt_3()
-                    .child(div().flex().gap_3().child(status_badge(status, cx)).child(format!("Uptime {uptime}")))
-                    .child(div().text_color(rgb(MUTED)).child(if profile.public { "Public access requested · 0.0.0.0" } else { "Private access requested · 127.0.0.1" }))))
-            .child(card().flex_1().min_h(px(145.)).flex().flex_col().overflow_hidden()
-                .child(div().px_4().py_2().flex().items_center().justify_between().border_b_1().border_color(rgb(LINE))
-                    .child(div().flex().items_center().gap_2().text_sm().font_weight(FontWeight::MEDIUM).child(Icon::new(IconName::Terminal).size_4()).child("Connection log"))
-                    .child(Button::new("copy-log").ghost().small().icon(IconName::Copy).label("Copy").disabled(session.is_none()).on_click({
-                        let text = session.map(|s| s.logs.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
-                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                    })))
-                .child(div().id("connection-log").track_scroll(&self.log_scroll).test_support().role(Role::Log).aria_label(session.map(|s| format!("SSH connection log. {}", s.logs.iter().cloned().collect::<Vec<_>>().join("\n"))).unwrap_or_else(|| "SSH connection log. Connect to see output.".into())).flex_1().min_h_0().overflow_y_scroll().p_4().bg(rgb(0x121216)).text_color(rgb(0xc9c9d2)).text_xs().font_family(cx.theme().mono_font_family.clone()).flex().flex_col().gap_1()
-                    .children(if let Some(session) = session { session.logs.iter().map(|s| div().child(s.clone()).into_any_element()).collect::<Vec<_>>() } else { vec![div().text_color(rgb(0x9d9daa)).child("Ready when you are. Connect to see OpenSSH output here.").into_any_element()] })))
-            .child(div().flex().items_center().justify_between().text_xs().text_color(rgb(MUTED))
-                .child("Logs stay in memory · Last 200 lines")
-                .child(Button::new("delete-tunnel").ghost().small().icon(IconName::Trash).label("Delete tunnel").disabled(active || self.path.is_none()).on_click(cx.listener(move |this, _, window, cx| this.delete(delete.clone(), window, cx)))))
+        div()
+            .id("connection-details")
+            .test_support()
+            .aria_label(profile.name.clone())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                card()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .truncate()
+                                            .child(profile.name.clone()),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(rgb(MUTED)).truncate().child(
+                                            format!(
+                                                "{}@{}:{} · {}",
+                                                profile.user,
+                                                profile.server,
+                                                profile.ssh_port,
+                                                if profile.identity.is_empty() {
+                                                    "SSH agent / default keys"
+                                                } else {
+                                                    "Private key"
+                                                }
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("edit-tunnel")
+                                            .ghost()
+                                            .icon(IconName::Pencil)
+                                            .label("Edit")
+                                            .tooltip("Edit tunnel")
+                                            .disabled(active || self.path.is_none())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.edit(Some(edit.clone()), window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("connect-tunnel")
+                                            .primary()
+                                            .icon(if active {
+                                                IconName::Square
+                                            } else {
+                                                IconName::Play
+                                            })
+                                            .label(if active { "Disconnect" } else { "Connect" })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle(&connect, cx)
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .bg(rgb(0x17171c))
+                            .p_3()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(endpoint(
+                                IconName::Server,
+                                "REMOTE SERVER",
+                                format!("{}:{}", profile.remote_bind(), profile.remote_port),
+                                profile.server.clone(),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(34.))
+                                    .text_center()
+                                    .text_color(rgb(ACCENT))
+                                    .child(Icon::new(IconName::ArrowRight).size_5()),
+                            )
+                            .child(endpoint(
+                                IconName::Laptop,
+                                "LOCAL SERVICE",
+                                format!("{}:{}", profile.local_host, profile.local_port),
+                                "This device".into(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .border_t_1()
+                            .border_color(rgb(LINE))
+                            .pt_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(status_badge(status, cx))
+                                    .child(format!("Uptime {uptime}")),
+                            )
+                            .child(div().text_color(rgb(MUTED)).child(if profile.public {
+                                "Public access requested · 0.0.0.0"
+                            } else {
+                                "Private access requested · 127.0.0.1"
+                            })),
+                    ),
+            )
+            .child(
+                card()
+                    .flex_1()
+                    .min_h(px(145.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(Icon::new(IconName::Terminal).size_4())
+                                    .child("Connection log"),
+                            )
+                            .child(
+                                Button::new("copy-log")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Copy)
+                                    .label("Copy")
+                                    .disabled(session.is_none())
+                                    .on_click({
+                                        let text = log_text.clone();
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                text.clone(),
+                                            ))
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("connection-log")
+                            .track_scroll(&self.log_scroll)
+                            .test_support()
+                            .focusable()
+                            .role(Role::Log)
+                            .aria_label(format!("SSH connection log. {log_text}"))
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .bg(rgb(0x121216))
+                            .text_color(rgb(0xc9c9d2))
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .when(session.is_none(), |element| {
+                                        element.text_color(rgb(0x9d9daa))
+                                    })
+                                    .child(SelectableText::new(
+                                        ("connection-log-text", profile.id),
+                                        log_text,
+                                    )),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Logs stay in memory · Last 200 lines")
+                    .child(
+                        Button::new("delete-tunnel")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Trash)
+                            .label("Delete tunnel")
+                            .disabled(active || self.path.is_none())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete(delete.clone(), window, cx)
+                            })),
+                    ),
+            )
     }
 }
 
@@ -503,10 +710,13 @@ fn status_badge(status: Status, cx: &App) -> impl IntoElement {
 mod tests {
     use super::TunnelView;
     use crate::{settings::Settings, tunnel::Profile};
-    use gpui_kit::{AppContext, TestAppContext, component::Root, px, size, test::TestWindowExt};
+    use gpui_kit::{
+        AppContext, ClipboardItem, TestAppContext, base::TextSelection, component::Root, point, px,
+        size, test::TestWindowExt,
+    };
 
     #[gpui_kit::test]
-    async fn sidebar_selection_shows_connection_details_and_keeps_log_visible(
+    async fn sidebar_selection_keeps_connection_log_visible_and_selectable(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
@@ -583,6 +793,26 @@ mod tests {
             assert!(
                 log.bottom() < px(800.),
                 "Connection log extends past the window: {log:?}"
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.blur(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            window.render_frame(cx);
+            let log = window.find("connection-log").bounds();
+            window.drag(
+                log.origin + point(px(16.), px(22.)),
+                point(log.right() - px(16.), log.top() + px(22.)),
+                cx,
+            );
+            let expected = "Ready when you are. Connect to see OpenSSH output here.";
+            assert_eq!(TextSelection::selected_text(window, cx), expected);
+            window.press("secondary-c", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected.into())
             );
         })
         .unwrap();
