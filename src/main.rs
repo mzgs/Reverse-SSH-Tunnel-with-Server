@@ -27,7 +27,6 @@ gpui_kit::assets::icon_assets!(
         Square,
         Copy,
         Trash,
-        Activity,
         Info
     ]
 );

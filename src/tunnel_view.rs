@@ -6,7 +6,7 @@ use crate::{
 use gpui_kit::{
     assets::IconName,
     component::{
-        ActiveTheme, Disableable, Icon, Sizable, WindowExt,
+        ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonVariants},
     },
     prelude::FluentBuilder,
@@ -146,9 +146,17 @@ impl TunnelView {
             .unwrap_or(Status::Stopped)
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(
+        &self,
+        profiles: &[Profile],
+        selected: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
-            .w(px(218.))
+            .id("connections-sidebar")
+            .test_support()
+            .w_72()
+            .min_h_0()
             .h_full()
             .flex_shrink_0()
             .bg(rgb(0x101013))
@@ -180,6 +188,16 @@ impl TunnelView {
                             .font_weight(FontWeight::BOLD)
                             .child("Portway"),
                     ),
+            )
+            .child(
+                Button::new("new-tunnel")
+                    .w_full()
+                    .mb_5()
+                    .primary()
+                    .icon(IconName::Plus)
+                    .label("New tunnel")
+                    .disabled(self.path.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx))),
             )
             .child(
                 div()
@@ -215,7 +233,7 @@ impl TunnelView {
                         .on_click(|_, window, cx| settings_view::guide(window, cx)),
                 ),
             )
-            .child(div().flex_1())
+            .child(self.profile_list(profiles, selected, cx))
             .child(
                 div()
                     .rounded_lg()
@@ -267,24 +285,21 @@ impl TunnelView {
     fn profile_list(
         &self,
         profiles: &[Profile],
-        selected: u64,
+        selected: Option<u64>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        card()
-            .w(px(265.))
-            .h_full()
-            .flex_shrink_0()
+        div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
-            .overflow_hidden()
+            .my_5()
             .child(
                 div()
-                    .p_4()
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("SAVED TUNNELS"),
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .mb_3()
+                    .child("Connections"),
             )
             .child(
                 div()
@@ -292,42 +307,56 @@ impl TunnelView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_2()
+                    .p_1()
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .when(profiles.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("No saved connections"),
+                        )
+                    })
                     .children(profiles.iter().map(|p| {
                         let id = p.id;
-                        let active = id == selected;
-                        let status = self.status(id);
-                        div()
-                            .rounded_lg()
-                            .p_3()
-                            .bg(rgb(if active { 0x2b3044 } else { 0x1c1c21 }))
-                            .child(
-                                Button::new(SharedString::from(format!("profile-{id}")))
-                                    .w_full()
-                                    .ghost()
-                                    .label(p.name.clone())
-                                    .icon(IconName::Terminal)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.selected = Some(id);
-                                        this.log_scroll.scroll_to_bottom();
-                                        this.error = None;
-                                        cx.notify();
-                                    })),
-                            )
+                        Button::new(SharedString::from(format!("profile-{id}")))
+                            .w_full()
+                            .h_16()
+                            .ghost()
+                            .selected(Some(id) == selected)
+                            .accessibility_label(p.name.clone())
+                            .tooltip(format!(
+                                "{} · {}@{}:{}",
+                                p.name, p.user, p.server, p.ssh_port
+                            ))
                             .child(
                                 div()
-                                    .mt_2()
+                                    .flex_1()
+                                    .min_w_0()
                                     .flex()
-                                    .justify_between()
+                                    .flex_col()
                                     .gap_2()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{} → {}", p.remote_port, p.local_port))
-                                    .child(status_badge(status)),
+                                    .text_left()
+                                    .child(div().truncate().child(p.name.clone()))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_between()
+                                            .gap_2()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("{} → {}", p.remote_port, p.local_port))
+                                            .child(status_badge(self.status(id))),
+                                    ),
                             )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(id);
+                                this.log_scroll.scroll_to_bottom();
+                                this.error = None;
+                                cx.notify();
+                            }))
                     })),
             )
     }
@@ -347,7 +376,7 @@ impl TunnelView {
                 format!("{}m {:02}s", seconds / 60, seconds % 60)
             })
             .unwrap_or_else(|| "—".into());
-        div().flex_1().min_w_0().h_full().flex().flex_col().gap_3()
+        div().id("connection-details").test_support().aria_label(profile.name.clone()).flex_1().min_w_0().h_full().flex().flex_col().gap_3()
             .child(card().p_4().flex().flex_col().gap_3()
                 .child(div().flex().items_center().justify_between().gap_3()
                     .child(div().min_w_0().flex().flex_col().gap_1().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).truncate().child(profile.name.clone())).child(div().text_xs().text_color(rgb(MUTED)).truncate().child(format!("{}@{}:{} · {}", profile.user, profile.server, profile.ssh_port, if profile.identity.is_empty() { "SSH agent / default keys" } else { "Private key" }))))
@@ -383,29 +412,17 @@ impl Render for TunnelView {
             .selected
             .and_then(|id| profiles.iter().find(|p| p.id == id))
             .or_else(|| profiles.last());
-        let connected = self
-            .sessions
-            .values()
-            .filter(|s| s.status == Status::Connected)
-            .count();
         div().size_full().flex().bg(rgb(0x131316)).text_color(rgb(INK))
-            .child(self.sidebar(cx))
+            .child(self.sidebar(&profiles, selected.map(|profile| profile.id), cx))
             .child(div().flex_1().min_w_0().h_full().flex().flex_col()
                 .child(div().h(px(55.)).flex_shrink_0().px_7().border_b_1().border_color(rgb(LINE)).flex().items_center().justify_between().bg(rgb(0x1c1c21))
                     .child(div().text_sm().text_color(rgb(MUTED)).child("Workspace   /   Reverse tunnels"))
                     .child(div().flex().items_center().gap_2().text_xs().text_color(rgb(MUTED)).child(div().size(px(6.)).rounded_full().bg(rgb(ACCENT))).child("ON THIS DEVICE")))
                 .child(div().id("workspace").flex_1().min_h_0().overflow_y_scroll().p_7().flex().flex_col().gap_5()
-                    .child(div().flex().items_center().justify_between().gap_4()
-                        .child(div().flex().flex_col().gap_1().child(div().text_3xl().font_weight(FontWeight::SEMIBOLD).child("Reverse tunnels")).child(div().text_sm().text_color(rgb(MUTED)).child("A secure path back to your local services.")))
-                        .child(Button::new("new-tunnel").primary().icon(IconName::Plus).label("New tunnel").disabled(self.path.is_none()).on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx)))))
                     .children(self.error.clone().map(|error| div().id("tunnel-error").test_support().role(Role::Alert).aria_label(error.clone()).rounded_md().border_1().border_color(rgb(0x76533e)).bg(rgb(0x33251e)).p_3().text_sm().text_color(rgb(0xf1b99b)).child(error)))
-                    .child(div().flex().gap_4()
-                        .child(metric("SAVED TUNNELS", profiles.len().to_string(), "Ready for your next connection", IconName::Waypoints))
-                        .child(metric("CONNECTED", connected.to_string(), "Remote forwarding confirmed", IconName::Activity))
-                        .child(metric("BUILT ON OPENSSH", "End-to-end".into(), "Encrypted between this device and server", IconName::ShieldCheck)))
                     .child(div().flex_1().min_h(px(410.)).flex().gap_4().map(|element| {
                         if let Some(profile) = selected {
-                            element.child(self.profile_list(&profiles, profile.id, cx)).child(self.details(profile, cx))
+                            element.child(self.details(profile, cx))
                         } else { element.child(self.empty(cx)) }
                     }))
                     .child(div().text_xs().text_color(rgb(MUTED)).flex().items_center().gap_2().child(Icon::new(IconName::Info).size_4()).child("Tunnels run while Portway is open. Closing the app disconnects every tunnel."))))
@@ -420,37 +437,6 @@ fn card() -> Div {
         .border_color(rgb(LINE))
 }
 
-fn metric(
-    label: &'static str,
-    value: String,
-    caption: &'static str,
-    icon: IconName,
-) -> impl IntoElement {
-    card()
-        .flex_1()
-        .min_w_0()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child(label)
-                .child(Icon::new(icon).size_4()),
-        )
-        .child(
-            div()
-                .text_2xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(value),
-        )
-        .child(div().text_xs().text_color(rgb(MUTED)).child(caption))
-}
 fn step(n: &'static str, text: &'static str) -> impl IntoElement {
     div()
         .flex()
@@ -520,18 +506,29 @@ mod tests {
     use gpui_kit::{AppContext, TestAppContext, component::Root, px, size, test::TestWindowExt};
 
     #[gpui_kit::test]
-    async fn dashboard_keeps_connection_log_visible(cx: &mut TestAppContext) {
+    async fn sidebar_selection_shows_connection_details_and_keeps_log_visible(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             cx.set_global(Settings {
-                profiles: vec![Profile {
-                    id: 1,
-                    name: "Local development".into(),
-                    server: "example.com".into(),
-                    user: "deploy".into(),
-                    ..Profile::default()
-                }],
+                profiles: vec![
+                    Profile {
+                        id: 1,
+                        name: "Local development".into(),
+                        server: "example.com".into(),
+                        user: "deploy".into(),
+                        ..Profile::default()
+                    },
+                    Profile {
+                        id: 2,
+                        name: "Staging service".into(),
+                        server: "staging.example.com".into(),
+                        user: "deploy".into(),
+                        ..Profile::default()
+                    },
+                ],
             });
         });
         let handle = cx.open_window(size(px(1200.), px(800.)), |window, cx| {
@@ -540,6 +537,44 @@ mod tests {
         });
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            let sidebar = window.find("connections-sidebar").bounds();
+            let row = window.find("profile-1").bounds();
+            assert!(
+                row.left() >= sidebar.left() && row.right() <= sidebar.right(),
+                "Connection row must be inside the sidebar: {row:?}, {sidebar:?}"
+            );
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Staging service")
+            );
+            window.click("profile-1", cx);
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Local development")
+            );
+            window.click("profile-2", cx);
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Staging service")
+            );
+            window.focus_next(cx);
+            window.render_frame(cx);
+            for _ in 0..8 {
+                if window.find("profile-1").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("profile-1").focused(), Some(true));
+            window.press("enter", cx);
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Local development")
+            );
+            assert!(
+                window.find("connection-details").bounds().left() >= sidebar.right(),
+                "Details must appear beside the sidebar"
+            );
             let log = window.find("connection-log").bounds();
             assert!(
                 log.size.height >= px(90.),
