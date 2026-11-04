@@ -1,7 +1,7 @@
 use crate::{settings::Settings, tunnel::Profile};
 use gpui_kit::{
     component::{
-        ActiveTheme, WindowExt,
+        ActiveTheme, Disableable, WindowExt,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
         dialog::{DialogAction, DialogFooter},
@@ -98,6 +98,90 @@ pub(crate) fn guide(window: &mut Window, cx: &mut App) {
                 .child(div().text_color(cx.theme().muted_foreground).child("Closing the app stops every tunnel. A connected tunnel confirms the remote listener; your local service must also be running.")))
             .child(DialogFooter::new().child(Button::new("close-guide").primary().label("Got it").on_click(|_, window, cx| window.close_dialog(cx))))
     });
+}
+
+pub(crate) fn preferences(path: Option<PathBuf>, window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let preferences = cx.new(|_| Preferences {
+        error: path.is_none().then(|| {
+            "Settings couldn’t be loaded. Fix the settings file and reopen Portway.".into()
+        }),
+        path,
+    });
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog.title("Settings").child(preferences.clone()).footer(
+            DialogFooter::new().child(
+                Button::new("close-settings")
+                    .label("Done")
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
+            ),
+        )
+    });
+}
+
+struct Preferences {
+    path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+impl Preferences {
+    fn set_start_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let result = (|| -> std::io::Result<()> {
+            let path = self
+                .path
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("Settings are unavailable"))?;
+            // Read from disk so invalid settings cannot be overwritten by this dialog.
+            let mut settings = Settings::read(path)?;
+            settings.start_at_login = enabled;
+            settings.save(path)?;
+            cx.set_global(settings);
+            cx.refresh_windows();
+            crate::startup::register(path, enabled).map_err(|error| {
+                std::io::Error::other(format!(
+                    "Preference saved, but couldn’t update launch at login: {error}. Try again or reopen Portway."
+                ))
+            })
+        })();
+        self.error = result.err().map(|error| error.to_string());
+        cx.notify();
+    }
+}
+
+impl Render for Preferences {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                Checkbox::new("start-at-login")
+                    .label("Start Portway when computer starts")
+                    .checked(cx.global::<Settings>().start_at_login)
+                    .disabled(self.path.is_none())
+                    .on_change(cx.listener(|this, enabled, _, cx| {
+                        this.set_start_at_login(*enabled, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Opens automatically after you sign in. Changes are saved immediately."),
+            )
+            .child(
+                div()
+                    .id("startup-error")
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label(self.error.clone().unwrap_or_default())
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .children(self.error.clone()),
+            )
+    }
 }
 
 fn guide_step(title: &'static str, description: &'static str) -> impl IntoElement {
@@ -286,7 +370,7 @@ impl Render for ProfileForm {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, open, private_key_directory};
+    use super::{Settings, open, preferences, private_key_directory};
     use gpui_kit::{
         App, AppContext, TestAppContext, Window, component::Root, div, px, size,
         test::TestWindowExt,
@@ -310,6 +394,72 @@ mod tests {
         std::fs::create_dir(&ssh).unwrap();
         assert_eq!(private_key_directory(&home), ssh);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn startup_checkbox_defaults_on_saves_changes_and_preserves_invalid_settings(
+        cx: &mut TestAppContext,
+    ) {
+        let directory =
+            std::env::temp_dir().join(format!("portway-preferences-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.json");
+        Settings::default().save(&path).unwrap();
+        // Simulate an already applied OS preference without changing this computer’s login items.
+        let marker = directory.join("startup.json");
+        crate::settings::write_json(&marker, &false).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings::default());
+        });
+        let handle = cx.open_window(size(px(1100.), px(760.)), |window, cx| {
+            let content = cx.new(|_| Empty);
+            Root::new(content, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            preferences(Some(path.clone()), window, cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("start-at-login").checked(), Some(true));
+            window.click("start-at-login", cx);
+            assert_eq!(window.find("start-at-login").checked(), Some(false));
+            assert!(!Settings::read(&path).unwrap().start_at_login);
+            assert!(!cx.global::<Settings>().start_at_login);
+            crate::settings::write_json(&marker, &true).unwrap();
+            for _ in 0..4 {
+                if window.find("start-at-login").focused() == Some(true) {
+                    break;
+                }
+                window.press("tab", cx);
+            }
+            assert_eq!(window.find("start-at-login").focused(), Some(true));
+            window.press("space", cx);
+            assert_eq!(window.find("start-at-login").checked(), Some(true));
+            assert!(Settings::read(&path).unwrap().start_at_login);
+            std::fs::write(&path, "invalid JSON").unwrap();
+            window.click("start-at-login", cx);
+            assert_eq!(window.find("start-at-login").checked(), Some(true));
+            assert!(!window.find("startup-error").label().unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid JSON");
+            window.click("close-settings", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            preferences(None, window, cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("start-at-login").disabled(), Some(true));
+            window.click("start-at-login", cx);
+            assert!(cx.global::<Settings>().start_at_login);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("start-at-login").is_none());
+        })
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui_kit::test]

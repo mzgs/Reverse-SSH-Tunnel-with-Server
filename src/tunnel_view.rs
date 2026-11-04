@@ -346,6 +346,17 @@ impl TunnelView {
             )
             .child(self.profile_list(profiles, selected, cx))
             .child(
+                Button::new("open-settings")
+                    .w_full()
+                    .mb_3()
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .label("Settings…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        settings_view::preferences(this.path.clone(), window, cx)
+                    })),
+            )
+            .child(
                 div()
                     .rounded_lg()
                     .border_1()
@@ -944,6 +955,7 @@ mod tests {
             gpui_kit::init(cx);
             cx.set_global(Settings {
                 profiles: vec![profile.clone()],
+                ..Settings::default()
             });
             cx.new(|cx| TunnelView::new(None, None, cx))
         });
@@ -1031,6 +1043,7 @@ mod tests {
                     ..profile
                 },
             ],
+            ..Settings::default()
         };
         settings.save(&path).unwrap();
         cx.update(|cx| {
@@ -1233,6 +1246,7 @@ mod tests {
                         ..profile
                     },
                 ],
+                ..Settings::default()
             });
             let view = cx.new(|cx| TunnelView::new(None, None, cx));
             view.update(cx, |view, _| {
@@ -1282,6 +1296,7 @@ mod tests {
                         ..Profile::default()
                     },
                 ],
+                ..Settings::default()
             });
         });
         let mut view = None;
@@ -1380,6 +1395,7 @@ mod tests {
                         ..Profile::default()
                     },
                 ],
+                ..Settings::default()
             });
         });
         let handle = cx.open_window(size(px(1200.), px(800.)), |window, cx| {

@@ -7,10 +7,20 @@ use std::{
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     pub(crate) profiles: Vec<crate::tunnel::Profile>,
+    pub(crate) start_at_login: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            start_at_login: true,
+        }
+    }
 }
 
 impl Settings {
@@ -130,6 +140,7 @@ mod tests {
         let result = (|| -> io::Result<()> {
             let mut settings = Settings::load(&path)?;
             assert_eq!(settings, Settings::default());
+            assert!(settings.start_at_login);
             assert!(path.exists());
             let missing = directory.join("missing.json");
             assert!(Settings::read(&missing).is_err());
@@ -143,9 +154,14 @@ mod tests {
                 autostart: true,
                 ..crate::tunnel::Profile::default()
             });
+            settings.start_at_login = false;
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?, settings);
             let mut old_settings = serde_json::to_value(&settings)?;
+            old_settings
+                .as_object_mut()
+                .unwrap()
+                .remove("start_at_login");
             old_settings["profiles"][0]
                 .as_object_mut()
                 .unwrap()
@@ -157,6 +173,10 @@ mod tests {
             fs::write(&path, serde_json::to_vec(&old_settings)?)?;
             assert!(Settings::load(&path)?.profiles[0].local_command.is_empty());
             assert!(!Settings::load(&path)?.profiles[0].autostart);
+            assert!(
+                Settings::load(&path)?.start_at_login,
+                "existing users default to enabled"
+            );
             // Old scaffold preferences still load without discarding the file on error.
             fs::write(&path, r#"{"display_name":"Lin"}"#)?;
             assert_eq!(Settings::load(&path)?, Settings::default());

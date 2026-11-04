@@ -2,6 +2,7 @@
 
 mod settings;
 mod settings_view;
+mod startup;
 mod tunnel;
 mod tunnel_view;
 mod window_state;
@@ -28,7 +29,8 @@ gpui_kit::assets::icon_assets!(
         Copy,
         Check,
         Trash,
-        Info
+        Info,
+        Settings
     ]
 );
 
@@ -123,7 +125,7 @@ fn main() {
                 std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
             })
     });
-    let (settings_path, settings, startup_error) = match loaded {
+    let (settings_path, settings, mut startup_error) = match loaded {
         Ok((path, settings)) => (Some(path), settings, None),
         Err(error) => (
             None,
@@ -133,6 +135,13 @@ fn main() {
             )),
         ),
     };
+    if let Some(path) = &settings_path
+        && let Err(error) = startup::register(path, settings.start_at_login)
+    {
+        startup_error = Some(format!(
+            "Couldn’t update launch at login: {error}. Check Settings to retry."
+        ));
+    }
     let (window_path, restored) = match WindowState::load() {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -162,6 +171,7 @@ fn main() {
     application.run(move |cx| {
         gpui_kit::init(cx);
         cx.set_global(settings);
+        let preferences_path = settings_path.clone();
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -211,15 +221,18 @@ fn main() {
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(move |_: &OpenSettings, cx| {
+            let path = preferences_path.clone();
             cx.defer(move |cx| {
-                let _ = cx.update_window(handle, |_, window, cx| settings_view::guide(window, cx));
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    settings_view::preferences(path, window, cx)
+                });
             });
         });
         cx.set_menus(vec![Menu {
             name: "Portway".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("Connection guide…", OpenSettings),
+                MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Quit", Quit),
             ],
