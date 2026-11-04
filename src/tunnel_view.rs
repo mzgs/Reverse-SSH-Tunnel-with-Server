@@ -31,6 +31,7 @@ pub(crate) struct TunnelView {
     sessions: HashMap<u64, Session>,
     services: HashMap<u64, Session>,
     existing_services: HashSet<u64>,
+    stopping_services: HashSet<u64>,
     error: Option<String>,
     log_scroll: ScrollHandle,
 }
@@ -82,6 +83,7 @@ impl TunnelView {
             sessions: HashMap::new(),
             services: HashMap::new(),
             existing_services: HashSet::new(),
+            stopping_services: HashSet::new(),
             error,
             log_scroll: ScrollHandle::new(),
         };
@@ -173,9 +175,32 @@ impl TunnelView {
     }
 
     fn toggle_service(&mut self, profile: &Profile, cx: &mut Context<Self>) {
+        if self.stopping_services.contains(&profile.id) {
+            return;
+        }
         self.error = None;
         if let Some(service) = self.services.get_mut(&profile.id).filter(|s| s.active()) {
             service.stop();
+        } else if self.existing_services.contains(&profile.id) {
+            self.stopping_services.insert(profile.id);
+            let profile = profile.clone();
+            let id = profile.id;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move { profile.stop_local_listener() })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.stopping_services.remove(&id);
+                    match result {
+                        Ok(()) => {
+                            this.existing_services.remove(&id);
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         } else {
             self.start_service(profile);
         }
@@ -452,6 +477,7 @@ impl TunnelView {
         let session = self.sessions.get(&profile.id);
         let service = self.services.get(&profile.id);
         let existing_service = self.existing_services.contains(&profile.id);
+        let stopping_service = self.stopping_services.contains(&profile.id);
         let log_text = if session.is_none() && service.is_none() {
             "Ready when you are. Connect to see OpenSSH output here.".into()
         } else {
@@ -545,7 +571,7 @@ impl TunnelView {
                                             .icon(IconName::Pencil)
                                             .label("Edit")
                                             .tooltip("Edit tunnel")
-                                            .disabled(self.path.is_none())
+                                            .disabled(self.path.is_none() || stopping_service)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.edit(Some(edit.clone()), window, cx)
                                             })),
@@ -553,6 +579,8 @@ impl TunnelView {
                                     .child(
                                         Button::new("connect-tunnel")
                                             .primary()
+                                            .when(active, |button| button.danger())
+                                            .disabled(stopping_service)
                                             .icon(if active {
                                                 IconName::Square
                                             } else {
@@ -639,21 +667,21 @@ impl TunnelView {
                                                 .child(label),
                                         ),
                                 )
-                                .when(!existing_service, |element| {
-                                    element.child(
-                                        Button::new("toggle-local-service")
-                                            .outline()
-                                            .small()
-                                            .label(if service_active {
-                                                "Stop service"
-                                            } else {
-                                                "Start service"
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.toggle_service(&local, cx)
-                                            })),
-                                    )
-                                }),
+                                .child(
+                                    Button::new("toggle-local-service")
+                                        .outline()
+                                        .small()
+                                        .label(if service_active || existing_service {
+                                            "Stop service"
+                                        } else {
+                                            "Start service"
+                                        })
+                                        .disabled(stopping_service)
+                                        .loading(stopping_service)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_service(&local, cx)
+                                        })),
+                                ),
                         )
                     })
                     .child(
@@ -770,7 +798,9 @@ impl TunnelView {
                             .small()
                             .icon(IconName::Trash)
                             .label("Delete tunnel")
-                            .disabled(active || service_active || self.path.is_none())
+                            .disabled(
+                                active || service_active || stopping_service || self.path.is_none(),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.delete(delete.clone(), window, cx)
                             })),
@@ -926,11 +956,17 @@ mod tests {
                 window.find("local-service-status").label(),
                 Some("Local service: Running")
             );
-            assert!(window.try_find("toggle-local-service").is_none());
+            let button = window.find("toggle-local-service");
+            assert_eq!(button.label(), Some("Stop service"));
+            assert_ne!(button.disabled(), Some(true));
+            window.click("toggle-local-service", cx);
         })
         .unwrap();
+        cx.run_until_parked();
         cx.update(|cx| {
             view.update(cx, |view, _| {
+                assert!(view.stopping_services.is_empty());
+                assert!(view.error.as_ref().unwrap().contains("Refusing"));
                 assert!(
                     view.services.is_empty(),
                     "An open port must skip the command"
@@ -1282,11 +1318,27 @@ mod tests {
                 window.find("local-service-status").label(),
                 Some("Local service: Running")
             );
+            assert_eq!(
+                window.find("toggle-local-service").label(),
+                Some("Stop service")
+            );
+            let service_button = window.find("toggle-local-service").bounds();
+            let service_status = window.find("local-service-status").bounds();
+            let connect_button = window.find("connect-tunnel").bounds();
+            assert!(service_button.left() > service_status.right());
+            assert!(service_button.top() < service_status.bottom());
+            assert!(service_button.bottom() > service_status.top());
+            assert!(service_button.top() > connect_button.bottom());
+            assert_eq!(service_button.right(), connect_button.right());
             assert!(window.find("connection-log").bounds().size.height >= px(90.));
             window.click("toggle-local-service", cx);
             assert_eq!(
                 window.find("local-service-status").label(),
                 Some("Local service: stopped")
+            );
+            assert_eq!(
+                window.find("toggle-local-service").label(),
+                Some("Start service")
             );
             window.click("toggle-local-service", cx);
             assert_eq!(

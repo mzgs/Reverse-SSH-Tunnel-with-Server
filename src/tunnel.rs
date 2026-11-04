@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::{self, Read},
-    net::{IpAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -46,6 +46,97 @@ impl Default for Profile {
 }
 
 impl Profile {
+    pub fn stop_local_listener(&self) -> Result<(), String> {
+        self.validate()?;
+        let local = (self.local_host.as_str(), 0)
+            .to_socket_addrs()
+            .map_err(|error| format!("Couldn’t resolve the local host: {error}"))?
+            .any(|address| UdpSocket::bind(address).is_ok());
+        if !local {
+            return Err("Only services on this computer can be stopped.".into());
+        }
+        if !self.local_port_is_open() {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        let output = Command::new("lsof")
+            .args([
+                "-nP",
+                "-t",
+                "-a",
+                &format!("-iTCP:{}", self.local_port),
+                "-sTCP:LISTEN",
+            ])
+            .output();
+        #[cfg(windows)]
+        let output = {
+            use std::os::windows::process::CommandExt;
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &format!(
+                    "$ErrorActionPreference='Stop'; Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq {} | Select-Object -ExpandProperty OwningProcess -Unique",
+                    self.local_port
+                )])
+                .creation_flags(0x08000000)
+                .output()
+        };
+        let output =
+            output.map_err(|error| format!("Couldn’t find the service process: {error}"))?;
+        if !output.status.success() && self.local_port_is_open() {
+            return Err(format!(
+                "Couldn’t find the service process: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut pids = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(|pid| {
+                pid.parse::<u32>()
+                    .map_err(|_| "Invalid service process ID.".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        pids.sort_unstable();
+        pids.dedup();
+        if pids
+            .iter()
+            .any(|pid| *pid <= 1 || *pid == std::process::id())
+        {
+            return Err("Refusing to stop Portway or a system process.".into());
+        }
+        for pid in pids {
+            #[cfg(unix)]
+            let result = Command::new("/bin/kill")
+                .args(["-KILL", "--", &pid.to_string()])
+                .output();
+            #[cfg(windows)]
+            let result = {
+                use std::os::windows::process::CommandExt;
+                Command::new("taskkill.exe")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .output()
+            };
+            let result = result.map_err(|error| format!("Couldn’t stop the service: {error}"))?;
+            if !result.status.success() && self.local_port_is_open() {
+                return Err(format!(
+                    "Couldn’t stop the service: {}",
+                    String::from_utf8_lossy(&result.stderr).trim()
+                ));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.local_port_is_open() {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Port {} is still in use. The service may have restarted or require additional permissions.",
+                    self.local_port
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
     pub fn local_port_is_open(&self) -> bool {
         (self.local_host.as_str(), self.local_port)
             .to_socket_addrs()
@@ -506,6 +597,79 @@ mod tests {
             server: "example.com".into(),
             user: "deploy".into(),
             ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn stops_an_external_listener_without_stopping_other_ports() {
+        if std::env::var_os("PORTWAY_TEST_LISTENER").is_some() {
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            println!(
+                "PORTWAY_TEST_PORT={}",
+                listener.local_addr().unwrap().port()
+            );
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tunnel::tests::stops_an_external_listener_without_stopping_other_ports",
+                "--nocapture",
+            ])
+            .env("PORTWAY_TEST_LISTENER", "1");
+        let mut external = Session::spawn(command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let port = loop {
+            external.poll();
+            if let Some(port) = external.logs.iter().find_map(|line| {
+                line.split_once("PORTWAY_TEST_PORT=")?
+                    .1
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+            }) {
+                break port;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Listener failed to start: {:?}",
+                external.logs
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut p = profile();
+        p.local_port = other.local_addr().unwrap().port();
+        assert!(p.stop_local_listener().unwrap_err().contains("Refusing"));
+        p.local_host = "192.0.2.1".into();
+        assert!(
+            p.stop_local_listener()
+                .unwrap_err()
+                .contains("this computer")
+        );
+        p.local_host = "127.0.0.1".into();
+        p.local_port = port;
+        assert!(p.local_port_is_open());
+        p.stop_local_listener().unwrap();
+        assert!(!p.local_port_is_open());
+        assert!(
+            TcpStream::connect(other.local_addr().unwrap()).is_ok(),
+            "An unrelated listener must remain running"
+        );
+        p.stop_local_listener().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while external.active() {
+            external.poll();
+            assert!(
+                Instant::now() < deadline,
+                "External service was left running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
