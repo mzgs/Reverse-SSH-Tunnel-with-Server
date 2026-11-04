@@ -21,7 +21,7 @@ pub(crate) fn register(settings_path: &Path, enabled: bool) -> io::Result<()> {
             #[cfg(target_os = "macos")]
             {
                 let mut builder = auto_launch::AutoLaunchBuilder::new();
-                builder.set_app_name("Portway");
+                builder.set_app_name("SSH Tunnel Plus");
                 builder
                     .set_app_path(path)
                     .set_macos_launch_mode(auto_launch::MacOSLaunchMode::SMAppService);
@@ -41,6 +41,7 @@ pub(crate) fn register(settings_path: &Path, enabled: bool) -> io::Result<()> {
             }
             #[cfg(target_os = "windows")]
             {
+                // Keep the registry value name stable across app renames.
                 let key = windows_registry::CURRENT_USER
                     .create(r"Software\Microsoft\Windows\CurrentVersion\Run")
                     .map_err(io::Error::from)?;
@@ -68,13 +69,14 @@ pub(crate) fn register(settings_path: &Path, enabled: bool) -> io::Result<()> {
                 let directory = dirs::config_dir()
                     .ok_or_else(|| io::Error::other("Could not find the configuration directory"))?
                     .join("autostart");
+                // Keep the filename stable so upgrades reuse the existing startup entry.
                 let entry = directory.join("Portway.desktop");
                 if enabled {
                     std::fs::create_dir_all(directory)?;
                     std::fs::write(
                         entry,
                         format!(
-                            "[Desktop Entry]\nType=Application\nName=Portway\nExec={}\nTerminal=false\n",
+                            "[Desktop Entry]\nType=Application\nName=SSH Tunnel Plus\nExec={}\nTerminal=false\n",
                             desktop_exec_path(path)
                         ),
                     )
@@ -126,8 +128,10 @@ mod tests {
 
     #[test]
     fn registration_runs_once_retries_failures_and_preserves_invalid_state() -> io::Result<()> {
-        let directory =
-            std::env::temp_dir().join(format!("portway-startup-test-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "ssh-tunnel-plus-startup-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir(&directory)?;
         let marker = directory.join("startup.json");
         let result = (|| {
@@ -160,8 +164,8 @@ mod tests {
     #[test]
     fn desktop_paths_keep_spaces_and_escape_exec_metacharacters() {
         assert_eq!(
-            desktop_exec_path("/home/me/My Apps/Portway"),
-            "\"/home/me/My Apps/Portway\""
+            desktop_exec_path("/home/me/My Apps/SSH Tunnel Plus"),
+            "\"/home/me/My Apps/SSH Tunnel Plus\""
         );
         assert_eq!(
             desktop_exec_path("/tmp/\\\"`$%\n\r\t"),

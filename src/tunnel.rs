@@ -101,7 +101,7 @@ impl Profile {
             .iter()
             .any(|pid| *pid <= 1 || *pid == std::process::id())
         {
-            return Err("Refusing to stop Portway or a system process.".into());
+            return Err("Refusing to stop SSH Tunnel Plus or a system process.".into());
         }
         for pid in pids {
             #[cfg(unix)]
@@ -602,11 +602,11 @@ mod tests {
 
     #[test]
     fn stops_an_external_listener_without_stopping_other_ports() {
-        if std::env::var_os("PORTWAY_TEST_LISTENER").is_some() {
+        if std::env::var_os("SSH_TUNNEL_PLUS_TEST_LISTENER").is_some() {
             use std::io::Write;
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             println!(
-                "PORTWAY_TEST_PORT={}",
+                "SSH_TUNNEL_PLUS_TEST_PORT={}",
                 listener.local_addr().unwrap().port()
             );
             std::io::stdout().flush().unwrap();
@@ -621,13 +621,13 @@ mod tests {
                 "tunnel::tests::stops_an_external_listener_without_stopping_other_ports",
                 "--nocapture",
             ])
-            .env("PORTWAY_TEST_LISTENER", "1");
+            .env("SSH_TUNNEL_PLUS_TEST_LISTENER", "1");
         let mut external = Session::spawn(command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let port = loop {
             external.poll();
             if let Some(port) = external.logs.iter().find_map(|line| {
-                line.split_once("PORTWAY_TEST_PORT=")?
+                line.split_once("SSH_TUNNEL_PLUS_TEST_PORT=")?
                     .1
                     .trim()
                     .parse::<u16>()
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn missing_key_fails_before_connecting() {
         let mut p = profile();
-        p.identity = "/nonexistent/portway-key".into();
+        p.identity = "/nonexistent/ssh-tunnel-plus-key".into();
         assert!(
             Session::start(&p)
                 .err()

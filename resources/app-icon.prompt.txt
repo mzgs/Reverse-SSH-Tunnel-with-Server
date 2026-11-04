@@ -1,0 +1,9 @@
+Generated using the built-in image_gen tool.
+
+Use case: logo-brand
+Asset type: production macOS desktop application icon for SSH Tunnel Plus, a native reverse SSH tunnel manager.
+Primary request: Create one beautiful, exceptionally clean, memorable app icon. A dark emerald rounded-square tile contains a bold warm-white tunnel portal and one mint directional arrow passing through the opening, suggesting an encrypted connection between computers. Treat the portal and arrow as one coherent, expertly balanced geometric mark.
+Style: refined native desktop icon; simple vector-like shapes with softly rounded edges, restrained depth, very subtle tonal shading on the tile, crisp silhouette. Quiet, precise, premium developer tool.
+Palette: deep emerald and forest green matching the app's green controls, warm ivory primary mark, a lighter mint arrow. High contrast.
+Composition: square 1024 by 1024 canvas. One centered rounded-square tile occupies approximately 84 percent of the canvas width, with transparent margins and smoothly antialiased transparent outer corners. The tunnel mark is centered and generously inset inside the tile. Strong simple shapes that remain recognizable at 16, 32, and 64 pixels.
+Constraints: actual isolated application icon ready for packaging, no presentation scene, no mockup, no surrounding objects, no letters, no typography, no watermark, no lock or shield, no circuit board details, no tiny decorations, no neon, no glass effects, no heavy extruded 3D, no excessive shine. Transparent background outside the tile.

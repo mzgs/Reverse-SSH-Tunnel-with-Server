@@ -297,7 +297,7 @@ impl TunnelView {
                         div()
                             .text_xl()
                             .font_weight(FontWeight::BOLD)
-                            .child("Portway"),
+                            .child("SSH Tunnel Plus"),
                     ),
             )
             .child(
@@ -379,7 +379,7 @@ impl TunnelView {
                             .child("Your keys stay yours"),
                     )
                     .child(div().text_xs().text_color(rgb(0xa7a7b1)).child(
-                        "Powered by OpenSSH. No passwords or private keys are stored in Portway.",
+                        "Powered by OpenSSH. No passwords or private keys are stored in SSH Tunnel Plus.",
                     )),
             )
             .child(
@@ -840,7 +840,7 @@ impl Render for TunnelView {
                             element.child(self.details(profile, cx))
                         } else { element.child(self.empty(cx)) }
                     }))
-                    .child(div().text_xs().text_color(rgb(MUTED)).flex().items_center().gap_2().child(Icon::new(IconName::Info).size_4()).child("Tunnels and local services run while Portway is open. Closing the app stops both."))))
+                    .child(div().text_xs().text_color(rgb(MUTED)).flex().items_center().gap_2().child(Icon::new(IconName::Info).size_4()).child("Tunnels and local services run while SSH Tunnel Plus is open. Closing the app stops both."))))
     }
 }
 
@@ -991,7 +991,7 @@ mod tests {
         });
         assert!(
             profile.local_port_is_open(),
-            "An existing service is not owned by Portway"
+            "An existing service is not owned by SSH Tunnel Plus"
         );
         drop(listener);
         cx.update(|cx| {
@@ -1013,7 +1013,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let directory =
-            std::env::temp_dir().join(format!("portway-live-edit-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ssh-tunnel-plus-live-edit-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("settings.json");
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -1225,7 +1225,7 @@ mod tests {
                         id: 4,
                         name: "Missing key".into(),
                         autostart: true,
-                        identity: "/nonexistent/portway-autostart-key".into(),
+                        identity: "/nonexistent/ssh-tunnel-plus-autostart-key".into(),
                         ..profile.clone()
                     },
                     profile.clone(),

@@ -183,7 +183,7 @@ fn main() {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
             window_min_size: Some(size(px(1100.), px(760.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Portway — Reverse SSH tunnels".into()),
+                title: Some("SSH Tunnel Plus — Reverse SSH tunnels".into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -229,7 +229,7 @@ fn main() {
             });
         });
         cx.set_menus(vec![Menu {
-            name: "Portway".into(),
+            name: "SSH Tunnel Plus".into(),
             disabled: false,
             items: vec![
                 MenuItem::action("Settings…", OpenSettings),

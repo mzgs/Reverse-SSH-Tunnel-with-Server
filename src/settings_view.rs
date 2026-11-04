@@ -106,7 +106,7 @@ pub(crate) fn preferences(path: Option<PathBuf>, window: &mut Window, cx: &mut A
     }
     let preferences = cx.new(|_| Preferences {
         error: path.is_none().then(|| {
-            "Settings couldn’t be loaded. Fix the settings file and reopen Portway.".into()
+            "Settings couldn’t be loaded. Fix the settings file and reopen SSH Tunnel Plus.".into()
         }),
         path,
     });
@@ -141,7 +141,7 @@ impl Preferences {
             cx.refresh_windows();
             crate::startup::register(path, enabled).map_err(|error| {
                 std::io::Error::other(format!(
-                    "Preference saved, but couldn’t update launch at login: {error}. Try again or reopen Portway."
+                    "Preference saved, but couldn’t update launch at login: {error}. Try again or reopen SSH Tunnel Plus."
                 ))
             })
         })();
@@ -158,7 +158,7 @@ impl Render for Preferences {
             .gap_3()
             .child(
                 Checkbox::new("start-at-login")
-                    .label("Start Portway when computer starts")
+                    .label("Start SSH Tunnel Plus when computer starts")
                     .checked(cx.global::<Settings>().start_at_login)
                     .disabled(self.path.is_none())
                     .on_change(cx.listener(|this, enabled, _, cx| {
@@ -360,8 +360,8 @@ impl Render for ProfileForm {
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Leave blank to use default keys or your SSH agent. Load encrypted keys with ssh-add."))
             .child(div().border_t_1().border_color(cx.theme().border).pt_3().flex().gap_3().child(self.field(5, "Local host")).child(self.field(6, "Local port")).child(self.field(7, "Remote port")))
             .child(self.field(8, "Local service command (optional)"))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Runs when Portway opens unless the local port is already listening. Use a foreground command; include cd to your project folder. Leave blank to start the service yourself."))
-            .child(Checkbox::new("autostart-ssh").label("Connect SSH when Portway opens").checked(self.profile.autostart).on_change(cx.listener(|this, value, _, cx| { this.profile.autostart = *value; cx.notify(); })))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Runs when SSH Tunnel Plus opens unless the local port is already listening. Use a foreground command; include cd to your project folder. Leave blank to start the service yourself."))
+            .child(Checkbox::new("autostart-ssh").label("Connect SSH when SSH Tunnel Plus opens").checked(self.profile.autostart).on_change(cx.listener(|this, value, _, cx| { this.profile.autostart = *value; cx.notify(); })))
             .child(Checkbox::new("public-access").label("Allow public access on the SSH server").checked(self.profile.public).on_change(cx.listener(|this, value, _, cx| { this.profile.public = *value; cx.notify(); })))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if self.profile.public { "Exposes your local service to the server’s network. Requires GatewayPorts clientspecified and a firewall rule. Protect the service with authentication." } else { "Private by default: the remote port is accessible only from the SSH server, subject to the server’s GatewayPorts policy." }))
             .child(div().id("profile-error").test_support().role(Role::Status).aria_label(self.error.clone().unwrap_or_default()).text_sm().text_color(cx.theme().danger).children(self.error.clone()))
@@ -384,7 +384,8 @@ mod tests {
 
     #[test]
     fn private_key_picker_prefers_ssh_directory_and_falls_back_to_home() {
-        let home = std::env::temp_dir().join(format!("portway-key-picker-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("ssh-tunnel-plus-key-picker-{}", std::process::id()));
         std::fs::create_dir(&home).unwrap();
         assert_eq!(private_key_directory(&home), home);
         let ssh = home.join(".ssh");
@@ -400,8 +401,10 @@ mod tests {
     async fn startup_checkbox_defaults_on_saves_changes_and_preserves_invalid_settings(
         cx: &mut TestAppContext,
     ) {
-        let directory =
-            std::env::temp_dir().join(format!("portway-preferences-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "ssh-tunnel-plus-preferences-{}",
+            std::process::id()
+        ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("settings.json");
         Settings::default().save(&path).unwrap();
@@ -464,7 +467,8 @@ mod tests {
 
     #[gpui_kit::test]
     async fn profile_form_validates_saves_and_preserves_on_cancel(cx: &mut TestAppContext) {
-        let directory = std::env::temp_dir().join(format!("portway-ui-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("ssh-tunnel-plus-ui-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("settings.json");
         Settings::default().save(&path).unwrap();

@@ -35,7 +35,7 @@ fn wait_for_exit_or_ready(session: &mut Session) {
 #[ignore = "requires /usr/sbin/sshd and permission to run a local SSH daemon"]
 fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
     let directory = std::env::temp_dir().join(format!(
-        "portway-ssh-{}-{}",
+        "ssh-tunnel-plus-ssh-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
