@@ -9,6 +9,7 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
         button::{Button, ButtonCustomVariant, ButtonVariants},
+        clipboard::Clipboard,
     },
     prelude::FluentBuilder,
     *,
@@ -475,7 +476,17 @@ impl TunnelView {
                                 IconName::Server,
                                 "REMOTE SERVER",
                                 format!("{}:{}", profile.remote_bind(), profile.remote_port),
-                                profile.server.clone(),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().min_w_0().truncate().child(profile.server.clone()))
+                                    .child(
+                                        Clipboard::new(("copy-server", profile.id))
+                                            .value(profile.server.clone())
+                                            .tooltip("Copy server address")
+                                            .accessibility_label("Copy server address"),
+                                    ),
                             ))
                             .child(
                                 div()
@@ -489,7 +500,7 @@ impl TunnelView {
                                 IconName::Laptop,
                                 "LOCAL SERVICE",
                                 format!("{}:{}", profile.local_host, profile.local_port),
-                                "This device".into(),
+                                "This device",
                             )),
                     )
                     .child(
@@ -663,7 +674,7 @@ fn endpoint(
     icon: IconName,
     label: &'static str,
     address: String,
-    caption: String,
+    caption: impl IntoElement,
 ) -> impl IntoElement {
     div()
         .flex_1()
@@ -814,6 +825,19 @@ mod tests {
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(expected.into())
             );
+            for (id, server) in [(1_u64, "example.com"), (2, "staging.example.com")] {
+                window.click(format!("profile-{id}"), cx);
+                let copy_id = gpui_kit::ElementId::from(("copy-server", id));
+                assert_eq!(
+                    window.find(copy_id.clone()).label(),
+                    Some("Copy server address")
+                );
+                window.click(copy_id, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(server.into())
+                );
+            }
         })
         .unwrap();
     }
