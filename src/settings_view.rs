@@ -9,7 +9,16 @@ use gpui_kit::{
     },
     *,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn private_key_directory(home: &Path) -> PathBuf {
+    let ssh = home.join(".ssh");
+    if ssh.is_dir() {
+        ssh
+    } else {
+        home.to_path_buf()
+    }
+}
 
 const IDS: [&str; 8] = [
     "tunnel-name",
@@ -198,25 +207,20 @@ impl ProfileForm {
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Choose SSH private key".into()),
-        });
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Choose SSH private key")
+            .set_parent(window);
+        if let Some(home) = dirs::home_dir() {
+            dialog = dialog.set_directory(private_key_directory(&home));
+        }
+        let picker = dialog.pick_file();
         cx.spawn_in(window, async move |this, cx| {
             let result = picker.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.first() {
-                            this.inputs[4].update(cx, |input, cx| {
-                                input.set_value(path.to_string_lossy().to_string(), window, cx)
-                            });
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    other => this.error = Some(format!("Couldn’t choose a key: {other:?}")),
+                if let Some(file) = result {
+                    this.inputs[4].update(cx, |input, cx| {
+                        input.set_value(file.path().to_string_lossy().to_string(), window, cx)
+                    });
                 }
                 cx.notify();
             });
@@ -245,7 +249,7 @@ impl Render for ProfileForm {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, open};
+    use super::{Settings, open, private_key_directory};
     use gpui_kit::{
         App, AppContext, TestAppContext, Window, component::Root, div, px, size,
         test::TestWindowExt,
@@ -255,6 +259,20 @@ mod tests {
         window.click(id, cx);
         window.press("secondary-a", cx);
         window.input(value, cx);
+    }
+
+    #[test]
+    fn private_key_picker_prefers_ssh_directory_and_falls_back_to_home() {
+        let home = std::env::temp_dir().join(format!("portway-key-picker-{}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        assert_eq!(private_key_directory(&home), home);
+        let ssh = home.join(".ssh");
+        std::fs::write(&ssh, "not a directory").unwrap();
+        assert_eq!(private_key_directory(&home), home);
+        std::fs::remove_file(&ssh).unwrap();
+        std::fs::create_dir(&ssh).unwrap();
+        assert_eq!(private_key_directory(&home), ssh);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[gpui_kit::test]
