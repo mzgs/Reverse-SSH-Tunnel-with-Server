@@ -139,10 +139,24 @@ mod tests {
                 name: "Development".into(),
                 server: "example.com".into(),
                 user: "deploy".into(),
+                local_command: "cd ~/my-app && npm start".into(),
+                autostart: true,
                 ..crate::tunnel::Profile::default()
             });
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?, settings);
+            let mut old_settings = serde_json::to_value(&settings)?;
+            old_settings["profiles"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("local_command");
+            old_settings["profiles"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("autostart");
+            fs::write(&path, serde_json::to_vec(&old_settings)?)?;
+            assert!(Settings::load(&path)?.profiles[0].local_command.is_empty());
+            assert!(!Settings::load(&path)?.profiles[0].autostart);
             // Old scaffold preferences still load without discarding the file on error.
             fs::write(&path, r#"{"display_name":"Lin"}"#)?;
             assert_eq!(Settings::load(&path)?, Settings::default());

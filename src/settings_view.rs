@@ -20,7 +20,7 @@ fn private_key_directory(home: &Path) -> PathBuf {
     }
 }
 
-const IDS: [&str; 8] = [
+const IDS: [&str; 9] = [
     "tunnel-name",
     "ssh-server",
     "ssh-user",
@@ -29,16 +29,25 @@ const IDS: [&str; 8] = [
     "local-host",
     "local-port",
     "remote-port",
+    "local-command",
 ];
 
-pub(crate) fn open(path: PathBuf, profile: Option<Profile>, window: &mut Window, cx: &mut App) {
+pub(crate) fn open(
+    path: PathBuf,
+    profile: Option<Profile>,
+    on_saved: impl Fn(&Profile, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if window.has_active_dialog(cx) {
         return;
     }
     let editing = profile.is_some();
     let form = cx.new(|cx| ProfileForm::new(path, profile.unwrap_or_default(), window, cx));
+    let on_saved = std::rc::Rc::new(on_saved);
     window.open_dialog(cx, move |dialog, _, _| {
         let confirm = form.clone();
+        let on_saved = on_saved.clone();
         dialog
             .title(if editing {
                 "Edit tunnel"
@@ -47,7 +56,31 @@ pub(crate) fn open(path: PathBuf, profile: Option<Profile>, window: &mut Window,
             })
             .width(px(620.))
             .child(form.clone())
-            .on_ok(move |_, _, cx| confirm.update(cx, |form, cx| form.save(cx)))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("cancel-profile")
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        DialogAction::new().child(Button::new("save-profile").primary().label(
+                            if editing {
+                                "Save and reconnect"
+                            } else {
+                                "Save tunnel"
+                            },
+                        )),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                if let Some(profile) = confirm.update(cx, |form, cx| form.save(cx)) {
+                    on_saved(&profile, cx);
+                    true
+                } else {
+                    false
+                }
+            })
     });
 }
 
@@ -94,6 +127,7 @@ impl ProfileForm {
             profile.local_host.clone(),
             profile.local_port.to_string(),
             profile.remote_port.to_string(),
+            profile.local_command.clone(),
         ];
         let placeholders = [
             "e.g. Development app",
@@ -104,6 +138,7 @@ impl ProfileForm {
             "127.0.0.1",
             "3000",
             "8080",
+            "e.g. cd ~/my-app && npm start",
         ];
         let inputs = values
             .into_iter()
@@ -124,8 +159,8 @@ impl ProfileForm {
         }
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        let result = (|| -> Result<Settings, String> {
+    fn save(&mut self, cx: &mut Context<Self>) -> Option<Profile> {
+        let result = (|| -> Result<(Settings, Profile), String> {
             let values: Vec<String> = self
                 .inputs
                 .iter()
@@ -149,6 +184,8 @@ impl ProfileForm {
                 local_port: port(6)?,
                 remote_port: port(7)?,
                 public: self.profile.public,
+                local_command: values[8].clone(),
+                autostart: self.profile.autostart,
             };
             profile.validate()?;
             let mut settings = cx.global::<Settings>().clone();
@@ -166,30 +203,30 @@ impl ProfileForm {
                     .unwrap_or(0)
                     .checked_add(1)
                     .ok_or("Tunnel ID limit reached")?;
-                settings.profiles.push(profile);
+                settings.profiles.push(profile.clone());
             } else {
                 let saved = settings
                     .profiles
                     .iter_mut()
                     .find(|p| p.id == profile.id)
                     .ok_or("This tunnel no longer exists")?;
-                *saved = profile;
+                *saved = profile.clone();
             }
             settings.save(&self.path).map_err(|e| {
                 format!("Couldn’t save the tunnel: {e}. Your previous profiles are preserved.")
             })?;
-            Ok(settings)
+            Ok((settings, profile))
         })();
         match result {
-            Ok(settings) => {
+            Ok((settings, profile)) => {
                 cx.set_global(settings);
                 cx.refresh_windows();
-                true
+                Some(profile)
             }
             Err(error) => {
                 self.error = Some(error);
                 cx.notify();
-                false
+                None
             }
         }
     }
@@ -232,18 +269,18 @@ impl ProfileForm {
 impl Render for ProfileForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().gap_3()
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Forward a port on your SSH server to a service on this device."))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(if self.profile.id == 0 { "Forward a port on your SSH server to a service on this device." } else { "Saving restarts the local service and reconnects SSH." }))
             .child(self.field(0, "Tunnel name"))
             .child(div().flex().gap_3().child(self.field(1, "SSH server")).child(self.field(2, "Username")).child(div().w(px(90.)).child(self.field(3, "SSH port"))))
             .child(div().flex().items_end().gap_2().child(self.field(4, "Private key (optional)")).child(Button::new("browse-key").outline().label("Browse…").on_click(cx.listener(|this, _, window, cx| this.browse(window, cx)))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Leave blank to use default keys or your SSH agent. Load encrypted keys with ssh-add."))
             .child(div().border_t_1().border_color(cx.theme().border).pt_3().flex().gap_3().child(self.field(5, "Local host")).child(self.field(6, "Local port")).child(self.field(7, "Remote port")))
+            .child(self.field(8, "Local service command (optional)"))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Runs when Portway opens unless the local port is already listening. Use a foreground command; include cd to your project folder. Leave blank to start the service yourself."))
+            .child(Checkbox::new("autostart-ssh").label("Connect SSH when Portway opens").checked(self.profile.autostart).on_change(cx.listener(|this, value, _, cx| { this.profile.autostart = *value; cx.notify(); })))
             .child(Checkbox::new("public-access").label("Allow public access on the SSH server").checked(self.profile.public).on_change(cx.listener(|this, value, _, cx| { this.profile.public = *value; cx.notify(); })))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if self.profile.public { "Exposes your local service to the server’s network. Requires GatewayPorts clientspecified and a firewall rule. Protect the service with authentication." } else { "Private by default: the remote port is accessible only from the SSH server, subject to the server’s GatewayPorts policy." }))
             .child(div().id("profile-error").test_support().role(Role::Status).aria_label(self.error.clone().unwrap_or_default()).text_sm().text_color(cx.theme().danger).children(self.error.clone()))
-            .child(DialogFooter::new()
-                .child(Button::new("cancel-profile").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
-                .child(DialogAction::new().child(Button::new("save-profile").primary().label("Save tunnel"))))
     }
 }
 
@@ -286,13 +323,14 @@ mod tests {
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             cx.set_global(Settings::default());
         });
-        let handle = cx.open_window(size(px(1000.), px(900.)), |window, cx| {
+        let handle = cx.open_window(size(px(1100.), px(760.)), |window, cx| {
             let content = cx.new(|_| Empty);
             Root::new(content, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
-            open(path.clone(), None, window, cx);
+            open(path.clone(), None, |_, _| {}, window, cx);
             window.render_frame(cx);
+            assert_eq!(window.find("autostart-ssh").checked(), Some(false));
             window.click("save-profile", cx);
         })
         .unwrap();
@@ -324,6 +362,8 @@ mod tests {
                     .contains("65535")
             );
             fill(window, "remote-port", "8080", cx);
+            fill(window, "local-command", "cd ~/my-app && npm start", cx);
+            window.click("autostart-ssh", cx);
             window.click("save-profile", cx);
         })
         .unwrap();
@@ -331,10 +371,25 @@ mod tests {
         let saved = Settings::read(&path).unwrap();
         assert_eq!(saved.profiles.len(), 1);
         assert_eq!(saved.profiles[0].name, "Development");
+        assert_eq!(saved.profiles[0].local_command, "cd ~/my-app && npm start");
+        assert!(saved.profiles[0].autostart);
         cx.update_window(handle.into(), |_, window, cx| {
-            open(path.clone(), Some(saved.profiles[0].clone()), window, cx);
+            open(
+                path.clone(),
+                Some(saved.profiles[0].clone()),
+                |_, _| {},
+                window,
+                cx,
+            );
             window.render_frame(cx);
+            assert_eq!(window.find("autostart-ssh").checked(), Some(true));
+            assert_eq!(
+                window.find("local-command").value(),
+                Some("cd ~/my-app && npm start")
+            );
             fill(window, "tunnel-name", "Discarded", cx);
+            fill(window, "local-command", "discarded command", cx);
+            window.click("autostart-ssh", cx);
             window.click("cancel-profile", cx);
         })
         .unwrap();

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::{self, Read},
-    net::IpAddr,
+    net::{IpAddr, TcpStream, ToSocketAddrs},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -20,6 +20,10 @@ pub(crate) struct Profile {
     pub local_port: u16,
     pub remote_port: u16,
     pub public: bool,
+    #[serde(default)]
+    pub local_command: String,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl Default for Profile {
@@ -35,11 +39,23 @@ impl Default for Profile {
             local_port: 3000,
             remote_port: 8080,
             public: false,
+            local_command: String::new(),
+            autostart: false,
         }
     }
 }
 
 impl Profile {
+    pub fn local_port_is_open(&self) -> bool {
+        (self.local_host.as_str(), self.local_port)
+            .to_socket_addrs()
+            .is_ok_and(|addresses| {
+                addresses.into_iter().any(|address| {
+                    TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+                })
+            })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty()
             || self.name.len() > 80
@@ -72,6 +88,9 @@ impl Profile {
         }
         if self.identity.len() > 4096 || self.identity.chars().any(char::is_control) {
             return Err("The identity file path is invalid.".into());
+        }
+        if self.local_command.len() > 4096 || self.local_command.chars().any(char::is_control) {
+            return Err("The local service command must be one line, up to 4096 bytes.".into());
         }
         Ok(())
     }
@@ -181,10 +200,26 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Process {
+    Ssh,
+    LocalService,
+}
+
+impl Process {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ssh => "OpenSSH",
+            Self::LocalService => "Local service",
+        }
+    }
+}
+
 pub(crate) struct Session {
+    process: Process,
     child: Option<Child>,
-    receiver: Receiver<Vec<u8>>,
-    pending: String,
+    receiver: Receiver<(usize, Vec<u8>)>,
+    pending: [String; 2],
     pub status: Status,
     pub logs: VecDeque<String>,
     pub connected_at: Option<Instant>,
@@ -210,38 +245,88 @@ impl Session {
     }
 
     fn spawn(mut command: Command) -> io::Result<Self> {
+        Self::spawn_process(&mut command, Process::Ssh)
+    }
+
+    pub fn start_local(profile: &Profile) -> Result<Self, String> {
+        profile.validate()?;
+        if profile.local_command.trim().is_empty() {
+            return Err("Enter a local service command first.".into());
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = Command::new("/bin/zsh");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = Command::new("/bin/sh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command
+                .arg("-lc")
+                .arg(&profile.local_command)
+                .process_group(0);
+        }
+        #[cfg(windows)]
+        let mut command = Command::new("cmd.exe");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.args(["/D", "/S", "/C", &profile.local_command]);
+            command.creation_flags(0x08000000);
+        }
+        command.current_dir(dirs::home_dir().ok_or("Couldn’t find your home directory.")?);
+        Self::spawn_process(&mut command, Process::LocalService)
+            .map_err(|error| format!("Couldn’t start the local service: {error}"))
+    }
+
+    fn spawn_process(command: &mut Command, process: Process) -> io::Result<Self> {
         let mut child = command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let streams: [Box<dyn Read + Send>; 2] = [
+            Box::new(child.stdout.take().expect("piped stdout")),
+            Box::new(child.stderr.take().expect("piped stderr")),
+        ];
         let (sender, receiver) = mpsc::sync_channel(64);
-        std::thread::spawn(move || {
-            let mut buffer = [0; 2048];
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if sender.send(buffer[..n].to_vec()).is_err() {
-                            break;
+        for (stream_id, mut stream) in streams.into_iter().enumerate() {
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if sender.send((stream_id, buffer[..n].to_vec())).is_err() {
+                                break;
+                            }
                         }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        }
         let mut session = Self {
+            process,
             child: Some(child),
             receiver,
-            pending: String::new(),
-            status: Status::Connecting,
+            pending: Default::default(),
+            status: if process == Process::Ssh {
+                Status::Connecting
+            } else {
+                Status::Connected
+            },
             logs: VecDeque::new(),
             connected_at: None,
             launched_at: Instant::now(),
         };
-        session.log("Starting OpenSSH. Waiting for the remote port to be confirmed.".into());
+        session.log(match process {
+            Process::Ssh => "Starting OpenSSH. Waiting for the remote port to be confirmed.".into(),
+            Process::LocalService => {
+                "Local service started. Check its output for readiness.".into()
+            }
+        });
         Ok(session)
     }
 
@@ -259,7 +344,8 @@ impl Session {
             .filter(|c| !c.is_control())
             .take(2048)
             .collect();
-        if self.status == Status::Connecting
+        if self.process == Process::Ssh
+            && self.status == Status::Connecting
             && line.starts_with("debug1: remote forward success for:")
         {
             self.status = Status::Connected;
@@ -267,51 +353,67 @@ impl Session {
             self.log("Remote forwarding confirmed. Tunnel is connected.".into());
         }
         if !line.trim().is_empty() {
-            self.log(line);
+            self.log(if self.process == Process::LocalService {
+                format!("[Local service] {line}")
+            } else {
+                line
+            });
         }
     }
 
     pub fn poll(&mut self) {
         // Bound both the queue and work per frame, even for a noisy SSH server.
         for _ in 0..64 {
-            let chunk = match self.receiver.try_recv() {
+            let (stream_id, chunk) = match self.receiver.try_recv() {
                 Ok(chunk) => chunk,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if !self.pending.is_empty() {
-                        let line = std::mem::take(&mut self.pending);
-                        self.line(line);
+                    for stream_id in 0..2 {
+                        if !self.pending[stream_id].is_empty() {
+                            let line = std::mem::take(&mut self.pending[stream_id]);
+                            self.line(line);
+                        }
                     }
                     break;
                 }
             };
-            self.pending.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(end) = self.pending.find('\n') {
-                let line: String = self.pending.drain(..=end).collect();
+            self.pending[stream_id].push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(end) = self.pending[stream_id].find('\n') {
+                let line: String = self.pending[stream_id].drain(..=end).collect();
                 self.line(line);
             }
-            if self.pending.len() > 4096 {
-                self.pending.clear();
+            if self.pending[stream_id].len() > 4096 {
+                self.pending[stream_id].clear();
             }
         }
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(code)) => {
-                    self.child = None;
-                    self.status = Status::Failed;
+                    self.close_child();
+                    self.status = if self.process == Process::LocalService && code.success() {
+                        Status::Stopped
+                    } else {
+                        Status::Failed
+                    };
                     self.log(format!(
-                        "SSH exited ({code}). Inspect the connection log, then reconnect."
+                        "{} exited ({code}). Inspect the log before restarting.",
+                        self.process.label()
                     ));
                 }
                 Err(error) => {
-                    self.log(format!("Couldn’t monitor SSH: {error}"));
+                    self.log(format!(
+                        "Couldn’t monitor {}: {error}",
+                        self.process.label()
+                    ));
                     self.stop();
                     self.status = Status::Failed;
                 }
                 Ok(None) => {}
             }
         }
-        if self.status == Status::Connecting && self.launched_at.elapsed() > Duration::from_secs(45)
+        if self.process == Process::Ssh
+            && self.status == Status::Connecting
+            && self.launched_at.elapsed() > Duration::from_secs(45)
         {
             self.stop();
             self.status = Status::Failed;
@@ -323,11 +425,47 @@ impl Session {
         self.child.is_some()
     }
 
-    pub fn stop(&mut self) {
+    fn close_child(&mut self) {
         if let Some(mut child) = self.child.take() {
+            if self.process == Process::LocalService {
+                // shortcut: foreground process trees only; use an OS service manager for daemons.
+                #[cfg(unix)]
+                let result = Command::new("/bin/kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .output();
+                #[cfg(windows)]
+                let result = {
+                    use std::os::windows::process::CommandExt;
+                    Command::new("taskkill.exe")
+                        .args(["/F", "/T", "/PID", &child.id().to_string()])
+                        .creation_flags(0x08000000)
+                        .output()
+                };
+                match result {
+                    Err(error) => {
+                        self.log(format!("Couldn’t stop local service subprocesses: {error}"))
+                    }
+                    Ok(output)
+                        if !output.status.success()
+                            && child.try_wait().ok().flatten().is_none() =>
+                    {
+                        self.log(format!(
+                            "Couldn’t stop local service subprocesses: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
-            self.log("Tunnel stopped. The SSH process has been closed.".into());
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if self.active() {
+            self.close_child();
+            self.log(format!("{} stopped.", self.process.label()));
         }
         self.status = Status::Stopped;
     }
@@ -342,6 +480,24 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_only_whether_the_local_port_accepts_connections() {
+        for host in ["127.0.0.1", "::1"] {
+            let Ok(listener) = std::net::TcpListener::bind((host, 0)) else {
+                assert_eq!(host, "::1", "IPv4 loopback must be available");
+                continue;
+            };
+            let p = Profile {
+                local_host: "localhost".into(),
+                local_port: listener.local_addr().unwrap().port(),
+                ..Profile::default()
+            };
+            assert!(p.local_port_is_open());
+            drop(listener);
+            assert!(!p.local_port_is_open());
+        }
+    }
 
     pub fn profile() -> Profile {
         Profile {
@@ -409,12 +565,94 @@ mod tests {
     }
 
     #[test]
+    fn local_command_is_optional_validated_and_reports_output_and_failure() {
+        let mut p = profile();
+        assert!(Session::start_local(&p).is_err());
+        for invalid in ["bad\0command".into(), "two\nlines".into(), "x".repeat(4097)] {
+            p.local_command = invalid;
+            assert!(Session::start_local(&p).is_err());
+        }
+        p.local_command = if cfg!(windows) {
+            "echo service-output & echo service-error >&2 & exit /B 7"
+        } else {
+            "printf 'service-output\\n'; printf 'service-error\\n' >&2; exit 7"
+        }
+        .into();
+        let mut service = Session::start_local(&p).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            service.poll();
+            if !service.active()
+                && service
+                    .logs
+                    .iter()
+                    .any(|line| line.contains("service-output"))
+                && service
+                    .logs
+                    .iter()
+                    .any(|line| line.contains("service-error"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!service.active());
+        assert_eq!(service.status, Status::Failed);
+        for expected in ["service-output", "service-error", "exited"] {
+            assert!(
+                service.logs.iter().any(|line| line.contains(expected)),
+                "{:?}",
+                service.logs
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_local_service_closes_its_child_processes() {
+        let mut p = profile();
+        p.local_command = "sleep 60 & echo CHILD:$!; wait".into();
+        let mut service = Session::start_local(&p).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            service.poll();
+            if let Some(pid) = service
+                .logs
+                .iter()
+                .find_map(|line| line.strip_prefix("[Local service] CHILD:"))
+            {
+                break pid.parse::<u32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "{:?}", service.logs);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        service.stop();
+        assert!(!service.active());
+        assert_eq!(service.status, Status::Stopped);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Command::new("/bin/kill")
+            .args(["-0", &child_pid.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Local service child {child_pid} was left running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
     fn readiness_requires_confirmation_and_logs_are_bounded() {
         let (_, receiver) = mpsc::sync_channel(1);
         let mut s = Session {
+            process: Process::Ssh,
             child: None,
             receiver,
-            pending: String::new(),
+            pending: Default::default(),
             status: Status::Connecting,
             logs: VecDeque::new(),
             connected_at: None,
@@ -438,7 +676,7 @@ mod tests {
         s.receiver = receiver;
         s.status = Status::Failed;
         sender
-            .send(b"late error without a newline".to_vec())
+            .send((1, b"late error without a newline".to_vec()))
             .unwrap();
         drop(sender);
         s.poll();

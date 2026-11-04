@@ -44,12 +44,30 @@ GPUI Kit is pinned to version 0.9.0 (revision `0ab9cf4e`), using GPUI Fast 0.1.1
 
 For access from other machines, explicitly enable **Allow public access**, configure `GatewayPorts clientspecified` on the server, and allow the remote port through its firewall. Protect the forwarded service with authentication. The server has the final say on bind addresses: `GatewayPorts yes` can force public binding even when a client requests loopback. For private access, use `GatewayPorts no` or `clientspecified`. See the [OpenSSH forwarding documentation](https://man.openbsd.org/ssh#R) and [server configuration reference](https://man.openbsd.org/sshd_config#GatewayPorts).
 
+## Start a local service automatically
+
+Set **Local service command (optional)** in a tunnel profile, for example:
+
+```sh
+cd ~/my-app && npm start
+```
+
+For every saved, nonblank command, Portway first checks the configured local host and port. If a TCP connection succeeds, it uses the existing service and skips the command. Otherwise it starts the command. This check runs when Portway opens, when you connect, and when you start the service. Running services show a green **Running** status; existing services have no service-control button. It checks only the port, without inspecting processes or sending application requests. Leave the command blank to manage the service yourself. Existing services are not owned or stopped by Portway; closing or quitting still stops every local service and SSH process Portway starts.
+
+Enable **Connect SSH when Portway opens** in a tunnel profile to connect it automatically at app startup. It is off by default, including for existing profiles. Any configured local service is checked or started before SSH is launched; its application readiness is not checked. SSH failures remain visible in the log or error message; retry with **Connect** once the network and SSH agent are ready.
+
+On macOS, commands run in a noninteractive login `/bin/zsh`, starting in your home directory; include `cd` for the project folder. Linux uses `/bin/sh -lc`; Windows uses `cmd.exe /D /S /C`. Use full executable paths if your shell's login configuration does not put your tools on PATH. Commands run with your account's permissions, so only save commands you trust.
+
+Keep the command in the foreground (no `&`, `nohup`, or daemon mode) so Portway can track it and stop its subprocesses. The tunnel details show service status, **Start service** / **Stop service**, and stdout/stderr in the connection log. **Edit** remains available while a profile is running. **Save and reconnect** saves the changes, stops that profile’s SSH tunnel and local service, then starts them with the saved settings, even if startup connection is disabled. Canceling, invalid input, and failed saves leave the running processes untouched. Other profiles keep running. Closing Portway force-stops the commands and their subprocesses; it does not wait for graceful shutdown. A running process does not confirm the service is ready or listening; failures remain in the log and require a manual restart.
+
+For startup at Mac login, build the `.app` with `./build.sh`, keep it in a permanent location, and add it in macOS **System Settings → General → Login Items → Open at Login**. Portway will start its saved local commands and connect tunnels with the checkbox enabled whenever macOS opens it after login.
+
 ## Behavior and limits
 
 - A tunnel becomes **Connected** only after OpenSSH confirms the remote forwarding request. This does not test the availability of your local service or a public firewall rule.
 - Keepalives detect a lost server connection. Failures remain visible in the log; reconnect manually. Closing or quitting the app stops and reaps its SSH child processes. Forced process termination or an OS crash can bypass cleanup.
 - Only key/default-key/agent authentication is supported. No password storage, SSH agent forwarding, automatic reconnect, jump hosts, SSH config aliases, background service, or server provisioning. Portway ignores user SSH config to avoid implicit forwards, proxy commands, and detached processes.
-- Logs are held in memory, capped at 200 lines per tunnel, and support text selection and copying. They may contain usernames, hostnames, and key paths; review before sharing.
+- Logs are held in memory, capped at 200 lines per process, and support text selection and copying. They may contain usernames, hostnames, key paths, and local command output; review before sharing.
 - Profiles store connection details and key **paths**, never key contents, in `settings.json` under the platform's local app-data directory named `reverse-ssh-tunnel-with-server`. Window geometry is stored alongside it. Invalid files are preserved and saving is disabled with an error message. Up to 100 profiles are supported.
 
 ## Check
@@ -60,7 +78,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Tests cover profile validation and persistence, SSH arguments, forwarding readiness, bounded logs, child-process cleanup, window geometry, and the profile editor's save/cancel/validation flow.
+Tests cover profile validation and persistence, SSH arguments, forwarding readiness, bounded logs, local command startup and output, child-process cleanup, window geometry, and the profile editor's save/cancel/validation flow.
 
 The optional loopback integration test starts a temporary `/usr/sbin/sshd` with throwaway keys, without changing your SSH configuration or known hosts. On a Unix machine with sshd installed and permission to run it:
 

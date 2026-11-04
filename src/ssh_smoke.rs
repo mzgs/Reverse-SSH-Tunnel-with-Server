@@ -111,6 +111,8 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
         local_port,
         remote_port,
         public: false,
+        local_command: String::new(),
+        autostart: false,
     };
     let start = || {
         let mut command = Command::new("ssh");
