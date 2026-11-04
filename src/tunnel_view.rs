@@ -283,15 +283,10 @@ impl TunnelView {
                     .pt_3()
                     .pb_8()
                     .child(
-                        div()
-                            .size(px(34.))
-                            .rounded_lg()
-                            .bg(rgb(0xdce4ff))
-                            .text_color(rgb(0x263b80))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::Waypoints).size_5()),
+                        img("app-icon.png")
+                            .id("app-icon")
+                            .size_10()
+                            .flex_shrink_0(),
                     )
                     .child(
                         div()

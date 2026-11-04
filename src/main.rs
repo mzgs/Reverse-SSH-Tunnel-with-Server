@@ -38,6 +38,11 @@ struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if path == "app-icon.png" {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../resources/app-icon.png"
+            ))));
+        }
         if let Some(bytes) = SettingsIcons.load(path)? {
             return Ok(Some(bytes));
         }
@@ -47,6 +52,9 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = gpui_kit::assets::Assets.list(path)?;
         paths.extend(SettingsIcons.list(path)?);
+        if "app-icon.png".starts_with(path) {
+            paths.push("app-icon.png".into());
+        }
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -54,6 +62,28 @@ impl AssetSource for Assets {
 }
 
 impl Global for Settings {}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssetSource, Assets};
+
+    #[test]
+    fn app_icon_is_embedded_and_discoverable() -> gpui_kit::Result<()> {
+        let bytes = Assets.load("app-icon.png")?.expect("app icon is embedded");
+        assert!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "app icon must be a PNG"
+        );
+        assert!(Assets.list("")?.contains(&"app-icon.png".into()));
+        assert!(
+            Assets
+                .list("icons/")?
+                .iter()
+                .all(|path| path.starts_with("icons/"))
+        );
+        Ok(())
+    }
+}
 
 actions!(base_app, [Quit, OpenSettings]);
 
