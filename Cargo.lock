@@ -6010,7 +6010,7 @@ dependencies = [
 
 [[package]]
 name = "reverse-ssh-tunnel-with-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "auto-launch",
  "dirs 6.0.0",
