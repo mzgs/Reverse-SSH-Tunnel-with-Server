@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            platform: macos-x86_64
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+      - name: Check tag matches Cargo version
+        run: |
+          version=$(cargo pkgid --offline | sed 's/.*@//')
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang cmake pkg-config libfontconfig-dev \
+            libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev \
+            libzstd-dev libasound2-dev libvulkan-dev
+      - name: Build and package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          ./build.sh
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "target/release/SSH Tunnel Plus.app" \
+            "dist/ssh-tunnel-plus-$GITHUB_REF_NAME-$PLATFORM.zip"
+      - name: Build Windows and Linux binaries
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Compress-Archive -Path "target/$env:TARGET/release/reverse-ssh-tunnel-with-server.exe", README.md -DestinationPath "dist/ssh-tunnel-plus-$env:GITHUB_REF_NAME-$env:PLATFORM.zip"
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/ssh-tunnel-plus-$GITHUB_REF_NAME-$PLATFORM.tar.gz" \
+            -C "target/$TARGET/release" reverse-ssh-tunnel-with-server -C "$GITHUB_WORKSPACE" README.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release with all four archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" ./* --clobber
+          else
+            gh release create "$RELEASE_TAG" ./* --draft --verify-tag --generate-notes --title "SSH Tunnel Plus $RELEASE_TAG"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false

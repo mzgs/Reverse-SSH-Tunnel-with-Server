@@ -26,7 +26,31 @@ cargo run --locked
 
   `./build.sh` or `cargo build --release --locked` creates `target/release/reverse-ssh-tunnel-with-server`.
 
-GPUI Kit is pinned to version 0.9.0 (revision `0ab9cf4e`), using GPUI Fast 0.1.13. CI checks all three operating systems; local validation is on macOS.
+GPUI Kit is pinned to version 0.9.0 (revision `0ab9cf4e`), using GPUI Fast 0.1.13. Release builds run on all four platforms below; local validation is on macOS.
+
+## Release
+
+Commit the release tooling and your changes first. With Python **3.11+**, Git, and a clean working tree on a branch that already exists on `origin`, run:
+
+```sh
+python3 release.py --dry-run  # Preview the next patch version; checks origin too
+python3 release.py            # For example, 0.1.0 → 0.1.1
+```
+
+The script updates only this app's version in `Cargo.toml` and `Cargo.lock`, commits it, creates an annotated `v…` tag, and atomically pushes the current branch and tag. It uses Git's existing `origin` credentials (including a token already stored in `.git/config`); no token is copied into source files. The token must permit repository pushes and workflow changes when first adding the workflow. The macOS bundle version follows Cargo automatically.
+
+The [release workflow](.github/workflows/release.yml) builds natively using GitHub's [hosted runners](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job). Once every build succeeds, it [publishes a GitHub Release](https://cli.github.com/manual/gh_release_create) with generated notes, `SHA256SUMS`, and:
+
+| Platform | Release archive |
+| --- | --- |
+| macOS Apple Silicon (ARM64) | `ssh-tunnel-plus-v<VERSION>-macos-arm64.zip` containing `SSH Tunnel Plus.app` |
+| macOS Intel (x86-64) | `ssh-tunnel-plus-v<VERSION>-macos-x86_64.zip` containing `SSH Tunnel Plus.app` |
+| Windows x86-64 | `ssh-tunnel-plus-v<VERSION>-windows-x86_64.zip` containing the `.exe` |
+| Linux x86-64 | `ssh-tunnel-plus-v<VERSION>-linux-x86_64.tar.gz` containing the executable |
+
+GitHub Actions uses its built-in `GITHUB_TOKEN` to publish; no additional release secret is required. Watch the repository's **Actions → Release** page. If a build fails, fix its cause and rerun the failed jobs, or commit the fix and create another patch release. If the push fails, the script keeps the local release commit and tag and prints the exact push command to retry; it does not reset your work.
+
+macOS bundles are ad hoc signed, without Apple notarization; Windows binaries are unsigned. Linux binaries target Ubuntu 24.04 or a compatible newer desktop and need the runtime libraries listed above. OpenSSH remains a runtime requirement on every platform. Validate the release tooling locally with `python3 -m unittest test_release`; this uses a temporary local Git remote and never publishes anything.
 
 ## First connection
 

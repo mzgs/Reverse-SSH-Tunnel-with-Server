@@ -12,6 +12,7 @@ fi
 
 host=$(rustup run stable rustc -vV | sed -n 's/^host: //p')
 rustup run stable cargo build --release --locked --target "$host" --target-dir target
+version=$(rustup run stable cargo pkgid --offline | sed 's/.*@//')
 
 bundle="target/release/$display_name.app"
 identifier="local.$(printf '%s' "$app_name" | tr '_' '-')"
@@ -29,8 +30,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleExecutable</key><string>$app_name</string>
 <key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>0.1.0</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>$version</string>
+<key>CFBundleShortVersionString</key><string>$version</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
