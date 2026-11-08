@@ -467,6 +467,11 @@ impl TunnelView {
                             .h_16()
                             .ghost()
                             .selected(Some(id) == selected)
+                            .when(Some(id) == selected, |row| {
+                                row.bg(cx.theme().selection)
+                                    .border_color(cx.theme().primary)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                            })
                             .accessibility_label(p.name.clone())
                             .tooltip(format!(
                                 "{} · {}@{}:{}",
