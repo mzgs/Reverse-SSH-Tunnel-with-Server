@@ -895,7 +895,7 @@ fn endpoint(
 fn status_badge(status: Status, cx: &App) -> impl IntoElement {
     let color = match status {
         Status::Connected => cx.theme().success,
-        Status::Connecting => rgb(0xf1cc83).into(),
+        Status::Connecting | Status::Reconnecting => rgb(0xf1cc83).into(),
         Status::Stopped => rgb(MUTED).into(),
         Status::Failed => rgb(0xffa99a).into(),
     };

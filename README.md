@@ -95,7 +95,7 @@ cd ~/my-app && npm start
 
 For every saved, nonblank command, SSH Tunnel Plus first checks the configured local host and port. If a TCP connection succeeds, it uses the existing service and skips the command. Otherwise it starts the command. This check runs when SSH Tunnel Plus opens, when you connect, and when you start the service. Running services show a green **Running** status; **Start service** / **Stop service** sits at the right of the service-status row, including for services started elsewhere. It checks only the port, without inspecting processes or sending application requests. Leave the command blank to manage the service yourself. **Stop service** also force-terminates processes listening on the configured local TCP port on this computer. This stops the whole process, including any other work it handles. Services on other computers cannot be stopped. On macOS/Linux this requires `lsof`; Windows uses PowerShell and `taskkill`. Permission or restart failures appear in the app. Closing or quitting stops only local services and SSH processes SSH Tunnel Plus starts.
 
-Enable **Connect SSH when SSH Tunnel Plus opens** in a tunnel profile to connect it automatically at app startup. It is off by default, including for existing profiles. Any configured local service is checked or started before SSH is launched; its application readiness is not checked. SSH failures remain visible in the log or error message; retry with **Connect** once the network and SSH agent are ready.
+Enable **Connect SSH when SSH Tunnel Plus opens** in a tunnel profile to connect it automatically at app startup. It is off by default, including for existing profiles. Any configured local service is checked or started before SSH is launched; its application readiness is not checked. Once started, SSH retries automatically after failures, including while the network or SSH agent is unavailable. Invalid profiles and missing identity files must be corrected before connecting.
 
 On macOS, commands run in a noninteractive login `/bin/zsh`, starting in your home directory; include `cd` for the project folder. Linux uses `/bin/sh -lc`; Windows uses `cmd.exe /D /S /C`. Use full executable paths if your shell's login configuration does not put your tools on PATH. Commands run with your account's permissions, so only save commands you trust.
 
@@ -108,8 +108,8 @@ You can also disable startup in your OS settings; SSH Tunnel Plus applies regist
 ## Behavior and limits
 
 - A tunnel becomes **Connected** only after OpenSSH confirms the remote forwarding request. This does not test the availability of your local service or a public firewall rule.
-- Keepalives detect a lost server connection. Failures remain visible in the log; reconnect manually. Closing or quitting the app stops and reaps its SSH child processes. Forced process termination or an OS crash can bypass cleanup.
-- Only key/default-key/agent authentication is supported. No password storage, SSH agent forwarding, automatic reconnect, jump hosts, SSH config aliases, background service, or server provisioning. SSH Tunnel Plus ignores user SSH config to avoid implicit forwards, proxy commands, and detached processes.
+- SSH keepalives run every 15 seconds and detect an unresponsive connection after three unanswered probes. Failed connections show **Reconnecting** and retry every five seconds without a retry limit while the app is open. Connected tunnels have no lifetime limit. **Disconnect** cancels retries. Sleep, network outages, and server failures can interrupt traffic; reconnecting restores the tunnel but existing TCP connections must be reopened by their applications. Closing or quitting the app stops retries and reaps its SSH child processes. Forced process termination or an OS crash can bypass cleanup.
+- Only key/default-key/agent authentication is supported. No password storage, SSH agent forwarding, jump hosts, SSH config aliases, background service, or server provisioning. SSH Tunnel Plus ignores user SSH config to avoid implicit forwards, proxy commands, and detached processes. Host-key verification stays strict on every retry; authentication and host-key failures remain in the log and require correcting the key, agent, or trusted host entry.
 - Logs are held in memory, capped at 200 lines per process, and support text selection and copying. They may contain usernames, hostnames, key paths, and local command output; review before sharing.
 - Profiles store connection details and key **paths**, never key contents, in `settings.json` under the platform's local app-data directory named `reverse-ssh-tunnel-with-server`. Window geometry is stored alongside it. Invalid files are preserved and saving is disabled with an error message. Up to 100 profiles are supported.
 
@@ -145,7 +145,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Tests cover profile validation and persistence, SSH arguments, forwarding readiness, bounded logs, local command startup and output, child-process cleanup, window geometry, and the profile editor's save/cancel/validation flow.
+Tests cover profile validation and persistence, SSH arguments, forwarding readiness, repeated reconnects after exits and timeouts, retry cancellation, bounded logs, local command startup and output, child-process cleanup, window geometry, and the profile editor's save/cancel/validation flow.
 
 The optional loopback integration test starts a temporary `/usr/sbin/sshd` with throwaway keys, without changing your SSH configuration or known hosts. On a Unix machine with sshd installed and permission to run it:
 
@@ -153,7 +153,7 @@ The optional loopback integration test starts a temporary `/usr/sbin/sshd` with 
 cargo test --locked forwards_real_traffic -- --ignored
 ```
 
-It checks traffic in both directions, unknown-host rejection, remote-port conflicts, and listener cleanup after disconnect.
+It checks traffic in both directions, unknown-host rejection, remote-port conflicts, automatic recovery after killing the SSH client, and listener cleanup after disconnect.
 
 ## Publishing a release (maintainers)
 

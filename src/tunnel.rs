@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Retry indefinitely without hammering an unavailable SSH server.
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Profile {
     pub id: u64,
@@ -275,6 +278,7 @@ fn valid_host(host: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Status {
     Connecting,
+    Reconnecting,
     Connected,
     Stopped,
     Failed,
@@ -284,6 +288,7 @@ impl Status {
     pub fn label(self) -> &'static str {
         match self {
             Self::Connecting => "Connecting",
+            Self::Reconnecting => "Reconnecting",
             Self::Connected => "Connected",
             Self::Stopped => "Stopped",
             Self::Failed => "Failed",
@@ -315,6 +320,8 @@ pub(crate) struct Session {
     pub logs: VecDeque<String>,
     pub connected_at: Option<Instant>,
     launched_at: Instant,
+    retry_command: Option<Command>,
+    retry_at: Option<Instant>,
 }
 
 impl Session {
@@ -330,11 +337,40 @@ impl Session {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW keeps OpenSSH inside the GUI.
         }
-        Self::spawn(command).map_err(|error| {
-            format!("Couldn’t start OpenSSH: {error}. Check that ssh is installed and on PATH.")
-        })
+        Ok(Self::start_ssh(command))
     }
 
+    fn start_ssh(mut command: Command) -> Self {
+        let mut session = match Self::spawn_process(&mut command, Process::Ssh) {
+            Ok(session) => session,
+            Err(error) => {
+                let (_, receiver) = mpsc::sync_channel(1);
+                let mut session = Self {
+                    process: Process::Ssh,
+                    child: None,
+                    receiver,
+                    pending: Default::default(),
+                    status: Status::Failed,
+                    logs: VecDeque::new(),
+                    connected_at: None,
+                    launched_at: Instant::now(),
+                    retry_command: None,
+                    retry_at: None,
+                };
+                session.log(format!(
+                    "Couldn’t start OpenSSH: {error}. Check that ssh is installed and on PATH."
+                ));
+                session
+            }
+        };
+        session.retry_command = Some(command);
+        if session.status == Status::Failed {
+            session.schedule_reconnect();
+        }
+        session
+    }
+
+    #[cfg(test)]
     fn spawn(mut command: Command) -> io::Result<Self> {
         Self::spawn_process(&mut command, Process::Ssh)
     }
@@ -411,6 +447,8 @@ impl Session {
             logs: VecDeque::new(),
             connected_at: None,
             launched_at: Instant::now(),
+            retry_command: None,
+            retry_at: None,
         };
         session.log(match process {
             Process::Ssh => "Starting OpenSSH. Waiting for the remote port to be confirmed.".into(),
@@ -486,17 +524,14 @@ impl Session {
                     } else {
                         Status::Failed
                     };
-                    self.log(format!(
-                        "{} exited ({code}). Inspect the log before restarting.",
-                        self.process.label()
-                    ));
+                    self.log(format!("{} exited ({code}).", self.process.label()));
                 }
                 Err(error) => {
                     self.log(format!(
                         "Couldn’t monitor {}: {error}",
                         self.process.label()
                     ));
-                    self.stop();
+                    self.close_child();
                     self.status = Status::Failed;
                 }
                 Ok(None) => {}
@@ -506,14 +541,44 @@ impl Session {
             && self.status == Status::Connecting
             && self.launched_at.elapsed() > Duration::from_secs(45)
         {
-            self.stop();
+            self.close_child();
             self.status = Status::Failed;
             self.log("Connection timed out before the remote port was confirmed.".into());
         }
+        if let Some(command) = &mut self.retry_command
+            && self
+                .retry_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            match Self::spawn_process(command, Process::Ssh) {
+                Ok(mut session) => {
+                    session.retry_command = self.retry_command.take();
+                    for line in session.logs.drain(..) {
+                        self.log(line);
+                    }
+                    session.logs = std::mem::take(&mut self.logs);
+                    *self = session;
+                }
+                Err(error) => {
+                    self.log(format!("Couldn’t restart OpenSSH: {error}"));
+                    self.status = Status::Failed;
+                }
+            }
+        }
+        if self.status == Status::Failed && self.retry_command.is_some() {
+            self.schedule_reconnect();
+        }
+    }
+
+    fn schedule_reconnect(&mut self) {
+        self.connected_at = None;
+        self.status = Status::Reconnecting;
+        self.retry_at = Some(Instant::now() + RECONNECT_DELAY);
+        self.log("Reconnecting in 5 seconds. Use Disconnect to stop retrying.".into());
     }
 
     pub fn active(&self) -> bool {
-        self.child.is_some()
+        self.child.is_some() || self.retry_command.is_some()
     }
 
     fn close_child(&mut self) {
@@ -558,6 +623,9 @@ impl Session {
             self.close_child();
             self.log(format!("{} stopped.", self.process.label()));
         }
+        self.retry_command = None;
+        self.retry_at = None;
+        self.connected_at = None;
         self.status = Status::Stopped;
     }
 }
@@ -691,6 +759,8 @@ mod tests {
             "StrictHostKeyChecking=yes",
             "ExitOnForwardFailure=yes",
             "BatchMode=yes",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=3",
         ] {
             assert!(args.iter().any(|a| a == flag));
         }
@@ -821,6 +891,8 @@ mod tests {
             logs: VecDeque::new(),
             connected_at: None,
             launched_at: Instant::now(),
+            retry_command: None,
+            retry_at: None,
         };
         s.line("Authenticated to example.com".into());
         s.line("Server banner: remote forward success for: fake".into());
@@ -875,6 +947,93 @@ mod tests {
         s.stop();
         assert!(!s.active());
         assert_eq!(s.status, Status::Stopped);
+    }
+
+    #[test]
+    fn ssh_retries_after_exit_and_timeout_until_explicitly_stopped() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p = Profile {
+            server: "127.0.0.1".into(),
+            ssh_port: listener.local_addr().unwrap().port(),
+            ..profile()
+        };
+        let mut session = Session::start(&p).unwrap();
+        session.log("Keep diagnostics across reconnects".into());
+        // A confirmed tunnel has no lifetime limit, even after weeks.
+        session.line("debug1: remote forward success for: test".into());
+        session.launched_at = Instant::now() - Duration::from_secs(21 * 24 * 60 * 60);
+        session.poll();
+        assert_eq!(session.status, Status::Connected);
+        assert!(session.child.is_some());
+
+        for _ in 0..3 {
+            let child = session.child.as_mut().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            session.poll();
+            assert_eq!(session.status, Status::Reconnecting);
+            assert!(session.active());
+            assert!(session.child.is_none());
+            assert!(session.connected_at.is_none());
+            let retry_at = session.retry_at;
+            session.poll();
+            assert_eq!(session.retry_at, retry_at, "Polling must not defer retries");
+            assert!(session.child.is_none(), "Must wait for the retry delay");
+            session.retry_at = Some(Instant::now());
+            session.poll();
+            assert_eq!(session.status, Status::Connecting);
+            assert!(session.child.is_some());
+            assert!(
+                session
+                    .logs
+                    .iter()
+                    .any(|line| line == "Keep diagnostics across reconnects")
+            );
+        }
+
+        session.launched_at = Instant::now() - Duration::from_secs(46);
+        session.poll();
+        assert_eq!(session.status, Status::Reconnecting);
+        assert!(session.child.is_none());
+        session.stop();
+        session.poll();
+        assert!(!session.active());
+        assert!(session.retry_at.is_none());
+        assert_eq!(session.status, Status::Stopped);
+
+        let mut session = Session::start(&p).unwrap();
+        session.stop();
+        session.poll();
+        assert!(
+            !session.active(),
+            "Stopping a live tunnel must also cancel retries"
+        );
+    }
+
+    #[test]
+    fn ssh_spawn_failures_keep_retrying_with_bounded_logs() {
+        let command =
+            Command::new(std::env::temp_dir().join("ssh-tunnel-plus-nonexistent-retry-command"));
+        let mut session = Session::start_ssh(command);
+        for _ in 0..120 {
+            assert_eq!(session.status, Status::Reconnecting);
+            assert!(session.active());
+            assert!(session.child.is_none());
+            assert!(session.retry_at.unwrap() > Instant::now());
+            session.retry_at = Some(Instant::now());
+            session.poll();
+        }
+        assert_eq!(session.logs.len(), 200);
+        assert!(
+            session
+                .logs
+                .iter()
+                .any(|line| line.contains("Couldn’t restart OpenSSH"))
+        );
+        session.stop();
+        session.poll();
+        assert!(!session.active());
+        assert_eq!(session.status, Status::Stopped);
     }
 }
 

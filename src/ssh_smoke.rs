@@ -31,6 +31,33 @@ fn wait_for_exit_or_ready(session: &mut Session) {
     }
 }
 
+fn check_traffic(local: &TcpListener, remote_port: u16) {
+    let mut remote = TcpStream::connect(("127.0.0.1", remote_port)).unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    remote.write_all(b"through the reverse tunnel").unwrap();
+    local.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut service = loop {
+        if let Ok((stream, _)) = local.accept() {
+            break stream;
+        }
+        assert!(Instant::now() < deadline, "local service was not reached");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    service
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut received = [0; 26];
+    service.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"through the reverse tunnel");
+    service.write_all(b"response").unwrap();
+    let mut response = [0; 8];
+    remote.read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"response");
+}
+
 #[test]
 #[ignore = "requires /usr/sbin/sshd and permission to run a local SSH daemon"]
 fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
@@ -114,7 +141,7 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
         local_command: String::new(),
         autostart: false,
     };
-    let start = || {
+    let ssh_command = || {
         let mut command = Command::new("ssh");
         command.args([
             "-o".to_string(),
@@ -125,8 +152,9 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
             "IdentityAgent=none".into(),
         ]);
         command.args(profile.ssh_args());
-        Session::spawn(command).unwrap()
+        command
     };
+    let start = || Session::spawn(ssh_command()).unwrap();
     // The production strict-host-key policy must reject even a reachable server.
     let mut unknown = start();
     wait_for_exit_or_ready(&mut unknown);
@@ -139,33 +167,10 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
     );
     let public_key = fs::read_to_string(directory.join("host.pub")).unwrap();
     fs::write(&known_hosts, format!("[127.0.0.1]:{ssh_port} {public_key}")).unwrap();
-    let mut tunnel = start();
+    let mut tunnel = Session::start_ssh(ssh_command());
     wait_for_exit_or_ready(&mut tunnel);
     assert_eq!(tunnel.status, Status::Connected, "{:?}", tunnel.logs);
-    let mut remote = TcpStream::connect(("127.0.0.1", remote_port)).unwrap();
-    remote
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    remote.write_all(b"through the reverse tunnel").unwrap();
-    local.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut service = loop {
-        if let Ok((stream, _)) = local.accept() {
-            break stream;
-        }
-        assert!(Instant::now() < deadline, "local service was not reached");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    service
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut received = [0; 26];
-    service.read_exact(&mut received).unwrap();
-    assert_eq!(&received, b"through the reverse tunnel");
-    service.write_all(b"response").unwrap();
-    let mut response = [0; 8];
-    remote.read_exact(&mut response).unwrap();
-    assert_eq!(&response, b"response");
+    check_traffic(&local, remote_port);
     let mut conflict = start();
     wait_for_exit_or_ready(&mut conflict);
     assert_eq!(conflict.status, Status::Failed, "{:?}", conflict.logs);
@@ -175,8 +180,24 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
             .iter()
             .any(|line| line.contains("remote port forwarding failed"))
     );
+
+    // Kill the client without requesting Disconnect, then recover real forwarding.
+    let child = tunnel.child.as_mut().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    tunnel.poll();
+    assert_eq!(tunnel.status, Status::Reconnecting);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while tunnel.status != Status::Connected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        tunnel.poll();
+    }
+    assert_eq!(tunnel.status, Status::Connected, "{:?}", tunnel.logs);
+    check_traffic(&local, remote_port);
+
     tunnel.stop();
     assert!(!tunnel.active());
+    assert!(tunnel.retry_at.is_none());
     let deadline = Instant::now() + Duration::from_secs(3);
     while TcpStream::connect(("127.0.0.1", remote_port)).is_ok() {
         assert!(
