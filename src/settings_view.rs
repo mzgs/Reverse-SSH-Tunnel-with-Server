@@ -84,22 +84,6 @@ pub(crate) fn open(
     });
 }
 
-pub(crate) fn guide(window: &mut Window, cx: &mut App) {
-    if window.has_active_dialog(cx) {
-        return;
-    }
-    window.open_dialog(cx, |dialog, _, cx| {
-        dialog.title("A small guide to going backward").width(px(650.))
-            .child(div().flex().flex_col().gap_4().text_sm()
-                .child(guide_step("01   Prepare your SSH server", "Use an SSH server you control. Enable AllowTcpForwarding yes (or remote) in sshd_config, then reload sshd. Public access also requires GatewayPorts clientspecified and an open firewall port."))
-                .child(guide_step("02   Trust the server and load your key", "In a terminal, connect with ssh -F /dev/null -p 22 user@server (use -F NUL on Windows). Verify its fingerprint with your server provider before accepting. Add an encrypted key with ssh-add, or choose a private key in the tunnel form. Password prompts are not supported."))
-                .child(guide_step("03   Map a remote port to your local service", "For a local app on 127.0.0.1:3000, choose remote port 8080. Connect the tunnel, then reach the app at 127.0.0.1:8080 on your SSH server. Enable public access only when you intend to expose the service."))
-                .child(div().p_3().rounded_md().bg(cx.theme().muted).child("OpenSSH 8.0+ must be on PATH. macOS includes it; install openssh-client on Linux or the OpenSSH Client optional feature on Windows. SSH config aliases and jump hosts are not used."))
-                .child(div().text_color(cx.theme().muted_foreground).child("Closing the app stops every tunnel. A connected tunnel confirms the remote listener; your local service must also be running.")))
-            .child(DialogFooter::new().child(Button::new("close-guide").primary().label("Got it").on_click(|_, window, cx| window.close_dialog(cx))))
-    });
-}
-
 pub(crate) fn preferences(path: Option<PathBuf>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
@@ -182,15 +166,6 @@ impl Render for Preferences {
                     .children(self.error.clone()),
             )
     }
-}
-
-fn guide_step(title: &'static str, description: &'static str) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-        .child(description)
 }
 
 struct ProfileForm {

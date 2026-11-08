@@ -8,7 +8,7 @@ use gpui_kit::{
     base::SelectableText,
     component::{
         ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
-        button::{Button, ButtonCustomVariant, ButtonVariants},
+        button::{Button, ButtonVariants},
         clipboard::Clipboard,
     },
     prelude::FluentBuilder,
@@ -74,6 +74,17 @@ impl TunnelView {
                 {
                     break;
                 }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok(refresh) = this.update(cx, |this, cx| this.refresh_existing_services(cx))
+                else {
+                    break;
+                };
+                refresh.await;
             }
         })
         .detach();
@@ -172,6 +183,53 @@ impl TunnelView {
                 false
             }
         }
+    }
+
+    fn refresh_existing_services(&self, cx: &mut Context<Self>) -> Task<()> {
+        let profiles: Vec<_> = cx
+            .global::<Settings>()
+            .profiles
+            .iter()
+            .filter(|profile| {
+                !profile.local_command.trim().is_empty()
+                    && !self.services.get(&profile.id).is_some_and(Session::active)
+                    && !self.stopping_services.contains(&profile.id)
+            })
+            .cloned()
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let statuses = cx
+                .background_spawn(async move {
+                    profiles
+                        .into_iter()
+                        .map(|profile| {
+                            let running = profile.local_port_is_open();
+                            (profile, running)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (profile, running) in statuses {
+                    // A profile or its owned service can change while the port check runs.
+                    if !cx.global::<Settings>().profiles.contains(&profile)
+                        || this.services.get(&profile.id).is_some_and(Session::active)
+                        || this.stopping_services.contains(&profile.id)
+                    {
+                        continue;
+                    }
+                    changed |= if running {
+                        this.existing_services.insert(profile.id)
+                    } else {
+                        this.existing_services.remove(&profile.id)
+                    };
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
     }
 
     fn toggle_service(&mut self, profile: &Profile, cx: &mut Context<Self>) {
@@ -304,40 +362,6 @@ impl TunnelView {
                     .label("New tunnel")
                     .disabled(self.path.is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x93939f))
-                    .mb_3()
-                    .child("WORKSPACE"),
-            )
-            .child(
-                Button::new("tunnels-nav")
-                    .w_full()
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(rgb(0x2d3040).into())
-                            .foreground(rgb(0xe0e6ff).into())
-                            .hover(rgb(0x383d50).into()),
-                    )
-                    .icon(IconName::Waypoints)
-                    .label("Reverse tunnels")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.selected = None;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div().mt_2().child(
-                    Button::new("connection-guide")
-                        .w_full()
-                        .ghost()
-                        .text_color(rgb(0xb1b1bc))
-                        .icon(IconName::BookOpen)
-                        .label("Connection guide")
-                        .on_click(|_, window, cx| settings_view::guide(window, cx)),
-                ),
             )
             .child(self.profile_list(profiles, selected, cx))
             .child(
@@ -924,6 +948,71 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    #[gpui_kit::test]
+    fn external_service_status_tracks_stops_and_restarts(cx: &mut TestAppContext) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let profile = Profile {
+            id: 1,
+            name: "External service".into(),
+            server: "example.com".into(),
+            user: "deploy".into(),
+            local_port: address.port(),
+            local_command: "must not run".into(),
+            ..Profile::default()
+        };
+        let view = cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings {
+                profiles: vec![profile],
+                ..Settings::default()
+            });
+            cx.new(|cx| TunnelView::new(None, None, cx))
+        });
+        let handle = cx.open_window(size(px(1100.), px(760.)), |window, cx| {
+            Root::new(view.clone(), window, cx)
+        });
+        drop(listener);
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("local-service-status").label(),
+                Some("Local service: stopped")
+            );
+            assert_eq!(
+                window.find("toggle-local-service").label(),
+                Some("Start service")
+            );
+        })
+        .unwrap();
+        let _listener = std::net::TcpListener::bind(address).unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("local-service-status").label(),
+                Some("Local service: Running")
+            );
+            assert_eq!(
+                window.find("toggle-local-service").label(),
+                Some("Stop service")
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                view.read(cx).services.is_empty(),
+                "Status checks must not start commands"
+            )
+        });
     }
 
     #[gpui_kit::test]

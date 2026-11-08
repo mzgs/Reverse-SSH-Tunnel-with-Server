@@ -16,7 +16,6 @@ gpui_kit::assets::icon_assets!(
     SettingsIcons,
     [
         Waypoints,
-        BookOpen,
         ShieldCheck,
         Plus,
         Terminal,

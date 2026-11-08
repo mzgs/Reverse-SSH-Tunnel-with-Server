@@ -51,11 +51,13 @@ impl Default for Profile {
 impl Profile {
     pub fn stop_local_listener(&self) -> Result<(), String> {
         self.validate()?;
-        let local = (self.local_host.as_str(), 0)
+        let addresses: Vec<_> = (self.local_host.as_str(), 0)
             .to_socket_addrs()
             .map_err(|error| format!("Couldn’t resolve the local host: {error}"))?
-            .any(|address| UdpSocket::bind(address).is_ok());
-        if !local {
+            .filter(|address| UdpSocket::bind(address).is_ok())
+            .map(|address| address.ip())
+            .collect();
+        if addresses.is_empty() {
             return Err("Only services on this computer can be stopped.".into());
         }
         if !self.local_port_is_open() {
@@ -66,7 +68,7 @@ impl Profile {
         let output = Command::new("lsof")
             .args([
                 "-nP",
-                "-t",
+                "-Fptn",
                 "-a",
                 &format!("-iTCP:{}", self.local_port),
                 "-sTCP:LISTEN",
@@ -75,10 +77,20 @@ impl Profile {
         #[cfg(windows)]
         let output = {
             use std::os::windows::process::CommandExt;
+            let addresses = addresses
+                .iter()
+                .map(|address| {
+                    format!(
+                        "'{address}', '{}'",
+                        if address.is_ipv4() { "0.0.0.0" } else { "::" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", &format!(
-                    "$ErrorActionPreference='Stop'; Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq {} | Select-Object -ExpandProperty OwningProcess -Unique",
-                    self.local_port
+                    "$ErrorActionPreference='Stop'; Get-NetTCPConnection -State Listen | Where-Object {{ $_.LocalPort -eq {} -and $_.LocalAddress -in @({addresses}) }} | Select-Object -ExpandProperty OwningProcess -Unique",
+                    self.local_port,
                 )])
                 .creation_flags(0x08000000)
                 .output()
@@ -91,6 +103,13 @@ impl Profile {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        #[cfg(unix)]
+        let mut pids = listener_pids(
+            &String::from_utf8_lossy(&output.stdout),
+            &addresses,
+            self.local_port,
+        )?;
+        #[cfg(windows)]
         let mut pids = String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .map(|pid| {
@@ -98,6 +117,9 @@ impl Profile {
                     .map_err(|_| "Invalid service process ID.".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if pids.is_empty() && self.local_port_is_open() {
+            return Err("No matching local listener found. For an IPv6 service, use its IPv6 address (for example ::1) as Local host.".into());
+        }
         pids.sort_unstable();
         pids.dedup();
         if pids
@@ -262,6 +284,49 @@ impl Profile {
     }
 }
 
+#[cfg(unix)]
+fn listener_pids(output: &str, addresses: &[IpAddr], port: u16) -> Result<Vec<u32>, String> {
+    use std::net::SocketAddr;
+
+    let mut pids = Vec::new();
+    let mut pid = None;
+    let mut family = "";
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = Some(
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid service process ID.")?,
+            );
+            family = "";
+        } else if let Some(value) = line.strip_prefix('t') {
+            family = value;
+        } else if let Some(value) = line.strip_prefix('n') {
+            let address = if value == format!("*:{port}") {
+                match family {
+                    "IPv4" => Some(SocketAddr::from(([0, 0, 0, 0], port))),
+                    "IPv6" => Some(SocketAddr::from(([0; 8], port))),
+                    _ => None,
+                }
+            } else {
+                value.parse::<SocketAddr>().ok()
+            };
+            if let Some(address) = address
+                && address.port() == port
+                && addresses.iter().any(|target| {
+                    // An IPv6-only wildcard can be unrelated to an IPv4 service on this port.
+                    address.ip() == *target
+                        || (address.ip().is_unspecified() && address.is_ipv4() == target.is_ipv4())
+                })
+                && let Some(pid) = pid
+            {
+                pids.push(pid);
+            }
+        }
+    }
+    Ok(pids)
+}
+
 fn valid_host(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
         || (!host.is_empty()
@@ -315,7 +380,7 @@ pub(crate) struct Session {
     process: Process,
     child: Option<Child>,
     receiver: Receiver<(usize, Vec<u8>)>,
-    pending: [String; 2],
+    pending: [Vec<u8>; 2],
     pub status: Status,
     pub logs: VecDeque<String>,
     pub connected_at: Option<Instant>,
@@ -500,16 +565,19 @@ impl Session {
                     for stream_id in 0..2 {
                         if !self.pending[stream_id].is_empty() {
                             let line = std::mem::take(&mut self.pending[stream_id]);
-                            self.line(line);
+                            self.line(String::from_utf8_lossy(&line).into_owned());
                         }
                     }
                     break;
                 }
             };
-            self.pending[stream_id].push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(end) = self.pending[stream_id].find('\n') {
-                let line: String = self.pending[stream_id].drain(..=end).collect();
-                self.line(line);
+            self.pending[stream_id].extend_from_slice(&chunk);
+            while let Some(end) = self.pending[stream_id]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
+                let line: Vec<_> = self.pending[stream_id].drain(..=end).collect();
+                self.line(String::from_utf8_lossy(&line).into_owned());
             }
             if self.pending[stream_id].len() > 4096 {
                 self.pending[stream_id].clear();
@@ -710,6 +778,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
+        let other_address = std::net::TcpListener::bind(("::1", port)).ok();
         let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let mut p = profile();
         p.local_port = other.local_addr().unwrap().port();
@@ -729,6 +798,12 @@ mod tests {
             TcpStream::connect(other.local_addr().unwrap()).is_ok(),
             "An unrelated listener must remain running"
         );
+        if let Some(listener) = other_address {
+            assert!(
+                TcpStream::connect(listener.local_addr().unwrap()).is_ok(),
+                "An unrelated listener on the same port must remain running"
+            );
+        }
         p.stop_local_listener().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while external.active() {
@@ -739,6 +814,58 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_lookup_matches_addresses_and_wildcards_in_the_same_family() {
+        let output = concat!(
+            "p10\nf3\ntIPv4\nn127.0.0.1:3000\n",
+            "p11\nf4\ntIPv6\nn[::1]:3000\n",
+            "p12\nf5\ntIPv4\nn*:3000\n",
+            "p13\nf6\ntIPv6\nn*:3000\n",
+            "p14\nf7\ntIPv4\nn127.0.0.2:3000\n",
+            "p15\nf8\ntIPv4\nn127.0.0.1:4000\n",
+        );
+        let ipv4 = "127.0.0.1".parse().unwrap();
+        let ipv6 = "::1".parse().unwrap();
+        assert_eq!(listener_pids(output, &[ipv4], 3000).unwrap(), [10, 12]);
+        assert_eq!(listener_pids(output, &[ipv6], 3000).unwrap(), [11, 13]);
+        assert_eq!(
+            listener_pids(output, &[ipv4, ipv6], 3000).unwrap(),
+            [10, 11, 12, 13]
+        );
+        assert!(listener_pids("pnot-a-pid\n", &[ipv4], 3000).is_err());
+    }
+
+    #[test]
+    fn log_output_preserves_utf8_split_between_chunks_and_flushes_at_eof() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut session = Session {
+            process: Process::LocalService,
+            child: None,
+            receiver,
+            pending: Default::default(),
+            status: Status::Stopped,
+            logs: VecDeque::new(),
+            connected_at: None,
+            launched_at: Instant::now(),
+            retry_command: None,
+            retry_at: None,
+        };
+        sender.send((0, vec![0xc3])).unwrap();
+        sender.send((1, vec![0xe2])).unwrap();
+        session.poll();
+        assert!(session.logs.is_empty());
+        sender.send((0, vec![0xa9, b'\n'])).unwrap();
+        sender.send((1, vec![0x82])).unwrap();
+        session.poll();
+        assert_eq!(session.logs.back().unwrap(), "[Local service] é");
+        sender.send((1, vec![0xac])).unwrap();
+        drop(sender);
+        session.poll();
+        assert_eq!(session.logs.back().unwrap(), "[Local service] €");
+        assert_eq!(session.logs.len(), 2);
     }
 
     #[test]
