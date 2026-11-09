@@ -244,25 +244,13 @@ impl ProfileForm {
                 remote_port: port(7)?,
                 public: self.profile.public,
                 local_command: values[8].clone(),
+                local_autostart: self.profile.local_autostart,
                 autostart: self.profile.autostart,
             };
             profile.validate()?;
             let mut settings = cx.global::<Settings>().clone();
             if profile.id == 0 {
-                if settings.profiles.len() >= 100 {
-                    return Err(
-                        "You can save up to 100 tunnels. Remove one before adding another.".into(),
-                    );
-                }
-                profile.id = settings
-                    .profiles
-                    .iter()
-                    .map(|p| p.id)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or("Tunnel ID limit reached")?;
-                settings.profiles.push(profile.clone());
+                profile = settings.add_profile(profile)?;
             } else {
                 let saved = settings
                     .profiles
@@ -335,7 +323,8 @@ impl Render for ProfileForm {
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Leave blank to use default keys or your SSH agent. Load encrypted keys with ssh-add."))
             .child(div().border_t_1().border_color(cx.theme().border).pt_3().flex().gap_3().child(self.field(5, "Local host")).child(self.field(6, "Local port")).child(self.field(7, "Remote port")))
             .child(self.field(8, "Local service command (optional)"))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Runs when SSH Tunnel Plus opens unless the local port is already listening. Use a foreground command; include cd to your project folder. Leave blank to start the service yourself."))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Runs before SSH connects or when you start the service, unless the local port is already listening. Use a foreground command; include cd to your project folder. Leave blank to start the service yourself."))
+            .child(Checkbox::new("autostart-local").label("Start local service when SSH Tunnel Plus opens").checked(self.profile.local_autostart).on_change(cx.listener(|this, value, _, cx| { this.profile.local_autostart = *value; cx.notify(); })))
             .child(Checkbox::new("autostart-ssh").label("Connect SSH when SSH Tunnel Plus opens").checked(self.profile.autostart).on_change(cx.listener(|this, value, _, cx| { this.profile.autostart = *value; cx.notify(); })))
             .child(Checkbox::new("public-access").label("Allow public access on the SSH server").checked(self.profile.public).on_change(cx.listener(|this, value, _, cx| { this.profile.public = *value; cx.notify(); })))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if self.profile.public { "Exposes your local service to the server’s network. Requires GatewayPorts clientspecified and a firewall rule. Protect the service with authentication." } else { "Private by default: the remote port is accessible only from the SSH server, subject to the server’s GatewayPorts policy." }))
@@ -460,6 +449,7 @@ mod tests {
             open(path.clone(), None, |_, _| {}, window, cx);
             window.render_frame(cx);
             assert_eq!(window.find("autostart-ssh").checked(), Some(false));
+            assert_eq!(window.find("autostart-local").checked(), Some(true));
             window.click("save-profile", cx);
         })
         .unwrap();
@@ -492,6 +482,7 @@ mod tests {
             );
             fill(window, "remote-port", "8080", cx);
             fill(window, "local-command", "cd ~/my-app && npm start", cx);
+            window.click("autostart-local", cx);
             window.click("autostart-ssh", cx);
             window.click("save-profile", cx);
         })
@@ -502,6 +493,7 @@ mod tests {
         assert_eq!(saved.profiles[0].name, "Development");
         assert_eq!(saved.profiles[0].local_command, "cd ~/my-app && npm start");
         assert!(saved.profiles[0].autostart);
+        assert!(!saved.profiles[0].local_autostart);
         cx.update_window(handle.into(), |_, window, cx| {
             open(
                 path.clone(),
@@ -512,12 +504,14 @@ mod tests {
             );
             window.render_frame(cx);
             assert_eq!(window.find("autostart-ssh").checked(), Some(true));
+            assert_eq!(window.find("autostart-local").checked(), Some(false));
             assert_eq!(
                 window.find("local-command").value(),
                 Some("cd ~/my-app && npm start")
             );
             fill(window, "tunnel-name", "Discarded", cx);
             fill(window, "local-command", "discarded command", cx);
+            window.click("autostart-local", cx);
             window.click("autostart-ssh", cx);
             window.click("cancel-profile", cx);
         })

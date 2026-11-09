@@ -24,6 +24,26 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(crate) fn add_profile(
+        &mut self,
+        mut profile: crate::tunnel::Profile,
+    ) -> Result<crate::tunnel::Profile, String> {
+        if self.profiles.len() >= 100 {
+            return Err("You can save up to 100 tunnels. Remove one before adding another.".into());
+        }
+        profile.validate()?;
+        profile.id = self
+            .profiles
+            .iter()
+            .map(|p| p.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("Tunnel ID limit reached")?;
+        self.profiles.push(profile.clone());
+        Ok(profile)
+    }
+
     pub(crate) fn path() -> io::Result<PathBuf> {
         let directory = dirs::data_local_dir()
             .ok_or_else(|| io::Error::other("Could not find the application data directory"))?;
@@ -129,6 +149,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adding_profiles_validates_limits_without_changing_existing_profiles() {
+        let profile = crate::tunnel::Profile {
+            name: "Development".into(),
+            server: "example.com".into(),
+            user: "deploy".into(),
+            ..crate::tunnel::Profile::default()
+        };
+        let mut settings = Settings::default();
+        assert!(
+            settings
+                .add_profile(crate::tunnel::Profile::default())
+                .is_err()
+        );
+        assert!(settings.profiles.is_empty());
+        assert_eq!(settings.add_profile(profile.clone()).unwrap().id, 1);
+        settings.profiles[0].id = u64::MAX;
+        let previous = settings.clone();
+        assert!(settings.add_profile(profile.clone()).is_err());
+        assert_eq!(settings, previous);
+        settings.profiles = (1..=100)
+            .map(|id| crate::tunnel::Profile {
+                id,
+                ..profile.clone()
+            })
+            .collect();
+        let previous = settings.clone();
+        assert!(settings.add_profile(profile).is_err());
+        assert_eq!(settings, previous);
+    }
+
+    #[test]
     fn settings_persist_defaults_changes_and_preserve_invalid_files() -> io::Result<()> {
         let directory = std::env::temp_dir().join(format!(
             "{}-settings-test-{}",
@@ -170,9 +221,14 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("autostart");
+            old_settings["profiles"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("local_autostart");
             fs::write(&path, serde_json::to_vec(&old_settings)?)?;
             assert!(Settings::load(&path)?.profiles[0].local_command.is_empty());
             assert!(!Settings::load(&path)?.profiles[0].autostart);
+            assert!(Settings::load(&path)?.profiles[0].local_autostart);
             assert!(
                 Settings::load(&path)?.start_at_login,
                 "existing users default to enabled"

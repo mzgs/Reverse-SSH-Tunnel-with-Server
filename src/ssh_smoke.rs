@@ -139,6 +139,7 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
         remote_port,
         public: false,
         local_command: String::new(),
+        local_autostart: true,
         autostart: false,
     };
     let ssh_command = || {

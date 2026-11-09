@@ -25,8 +25,14 @@ pub(crate) struct Profile {
     pub public: bool,
     #[serde(default)]
     pub local_command: String,
+    #[serde(default = "default_local_autostart")]
+    pub local_autostart: bool,
     #[serde(default)]
     pub autostart: bool,
+}
+
+fn default_local_autostart() -> bool {
+    true
 }
 
 impl Default for Profile {
@@ -43,6 +49,7 @@ impl Default for Profile {
             remote_port: 8080,
             public: false,
             local_command: String::new(),
+            local_autostart: true,
             autostart: false,
         }
     }

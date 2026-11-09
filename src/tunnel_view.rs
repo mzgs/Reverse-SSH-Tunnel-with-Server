@@ -101,7 +101,7 @@ impl TunnelView {
         for profile in &cx.global::<Settings>().profiles {
             if profile.autostart {
                 view.connect(profile);
-            } else if !profile.local_command.trim().is_empty() {
+            } else if profile.local_autostart && !profile.local_command.trim().is_empty() {
                 view.start_service(profile);
             }
         }
@@ -113,6 +113,45 @@ impl TunnelView {
             session.stop();
         }
         self.existing_services.clear();
+    }
+
+    fn duplicate(&mut self, mut profile: Profile, cx: &mut Context<Self>) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let result = (|| -> Result<(Settings, Profile), String> {
+            let mut settings = cx.global::<Settings>().clone();
+            for number in 2.. {
+                let suffix = format!(" {number}");
+                let mut name = profile.name.clone();
+                while name.len() + suffix.len() > 80 {
+                    name.pop();
+                }
+                name.push_str(&suffix);
+                if !settings.profiles.iter().any(|p| p.name == name) {
+                    profile.name = name;
+                    break;
+                }
+            }
+            profile.autostart = false;
+            profile.local_autostart = false;
+            let profile = settings.add_profile(profile)?;
+            settings
+                .save(path)
+                .map_err(|error| format!("Couldn’t duplicate tunnel: {error}"))?;
+            Ok((settings, profile))
+        })();
+        match result {
+            Ok((settings, profile)) => {
+                cx.set_global(settings);
+                self.selected = Some(profile.id);
+                self.log_scroll.scroll_to_bottom();
+                self.error = None;
+                cx.refresh_windows();
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
     }
 
     fn edit(&self, profile: Option<Profile>, window: &mut Window, cx: &mut Context<Self>) {
@@ -192,6 +231,9 @@ impl TunnelView {
             .iter()
             .filter(|profile| {
                 !profile.local_command.trim().is_empty()
+                    && (profile.local_autostart
+                        || self.services.contains_key(&profile.id)
+                        || self.existing_services.contains(&profile.id))
                     && !self.services.get(&profile.id).is_some_and(Session::active)
                     && !self.stopping_services.contains(&profile.id)
             })
@@ -535,6 +577,7 @@ impl TunnelView {
         let service_active = service.is_some_and(Session::active);
         let local = profile.clone();
         let edit = profile.clone();
+        let duplicate = profile.clone();
         let connect = profile.clone();
         let delete = profile.clone();
         let uptime = session
@@ -600,6 +643,17 @@ impl TunnelView {
                                 div()
                                     .flex()
                                     .gap_2()
+                                    .child(
+                                        Button::new("duplicate-tunnel")
+                                            .ghost()
+                                            .icon(IconName::Copy)
+                                            .label("Duplicate")
+                                            .tooltip("Duplicate tunnel with local service and SSH stopped")
+                                            .disabled(self.path.is_none())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.duplicate(duplicate.clone(), cx)
+                                            })),
+                                    )
                                     .child(
                                         Button::new("edit-tunnel")
                                             .ghost()
@@ -953,6 +1007,137 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    #[gpui_kit::test]
+    async fn duplicates_are_saved_selected_and_stay_stopped(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("ssh-tunnel-plus-duplicate-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.json");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let profile = Profile {
+            id: 1,
+            name: "Development".into(),
+            server: "127.0.0.1".into(),
+            ssh_port: listener.local_addr().unwrap().port(),
+            user: "deploy".into(),
+            local_port: unused_port(),
+            local_command: if cfg!(windows) {
+                "ping -n 61 127.0.0.1 >NUL"
+            } else {
+                "sleep 60"
+            }
+            .into(),
+            autostart: true,
+            ..Profile::default()
+        };
+        let settings = Settings {
+            profiles: vec![profile.clone()],
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        let view = cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(settings);
+            cx.new(|cx| TunnelView::new(Some(path.clone()), None, cx))
+        });
+        let handle = cx.open_window(size(px(1100.), px(760.)), |window, cx| {
+            Root::new(view.clone(), window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("duplicate-tunnel", cx);
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Development 2")
+            );
+            assert_eq!(window.find("connect-tunnel").label(), Some("Connect"));
+            assert_eq!(
+                window.find("local-service-status").label(),
+                Some("Local service: stopped")
+            );
+            window.click("profile-1", cx);
+            window.click("duplicate-tunnel", cx);
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Development 3")
+            );
+        })
+        .unwrap();
+        let saved = Settings::read(&path).unwrap();
+        assert_eq!(saved.profiles[0], profile);
+        assert_eq!(
+            saved.profiles[1],
+            Profile {
+                id: 2,
+                name: "Development 2".into(),
+                autostart: false,
+                local_autostart: false,
+                ..profile.clone()
+            }
+        );
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.selected, Some(3));
+            assert_eq!(view.sessions.len(), 1);
+            assert_eq!(view.services.len(), 1);
+            assert!(view.sessions[&1].active());
+            assert!(view.services[&1].active());
+        });
+        // A duplicate must not adopt the original's local listener during status refresh.
+        let _local_listener =
+            std::net::TcpListener::bind(("127.0.0.1", profile.local_port)).unwrap();
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("local-service-status").label(),
+                Some("Local service: stopped")
+            );
+            window.click("profile-1", cx);
+            let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&temporary, "occupied").unwrap();
+            window.click("duplicate-tunnel", cx);
+            assert!(
+                window
+                    .find("tunnel-error")
+                    .label()
+                    .unwrap()
+                    .contains("Couldn’t duplicate")
+            );
+            assert_eq!(
+                window.find("connection-details").label(),
+                Some("Development")
+            );
+            assert_eq!(Settings::read(&path).unwrap(), saved);
+            assert_eq!(*cx.global::<Settings>(), saved);
+            std::fs::remove_file(temporary).unwrap();
+            window.click("profile-3", cx);
+            window.click("toggle-local-service", cx);
+            assert_eq!(
+                window.find("local-service-status").label(),
+                Some("Local service: Running")
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            view.update(cx, |view, _| view.stop_all());
+            cx.set_global(Settings::read(&path).unwrap());
+            let reopened = cx.new(|cx| TunnelView::new(Some(path.clone()), None, cx));
+            reopened.update(cx, |view, _| {
+                assert!(!view.sessions.contains_key(&2));
+                assert!(!view.services.contains_key(&2));
+                assert!(!view.existing_services.contains(&2));
+                assert!(!view.sessions.contains_key(&3));
+                assert!(!view.services.contains_key(&3));
+                view.stop_all();
+            });
+        });
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui_kit::test]
