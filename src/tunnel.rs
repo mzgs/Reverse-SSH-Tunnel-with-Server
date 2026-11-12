@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -10,6 +10,67 @@ use std::{
 
 // Retry indefinitely without hammering an unavailable SSH server.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+// Cleanup is requested only when forwarding fails, and targets SSH sessions on this port.
+const REMOTE_WATCHDOG: &str = r#"exec bash -c '
+parent=$PPID
+[ "$parent" -gt 1 ] && kill -0 "$parent" || exit 1
+command -v ps >/dev/null || exit 1
+cleanup_remote_port() {
+    port=$1
+    if [ "$port" = "${SSH_CONNECTION##* }" ]; then
+        printf "%s\n" "Refusing to stop the SSH server listening on port $port." >&2
+        return 1
+    fi
+    pids=
+    if command -v ss >/dev/null; then
+        listing=$(ss -H -ltnp "sport = :$port") || return 1
+        while [[ $listing =~ pid=([0-9]+) ]]; do
+            pids="$pids ${BASH_REMATCH[1]}"
+            listing=${listing#*"pid=${BASH_REMATCH[1]}"}
+        done
+    elif command -v lsof >/dev/null; then
+        pids=$(lsof -nP -t -a -iTCP:"$port" -sTCP:LISTEN)
+    else
+        printf "%s\n" "Automatic port cleanup requires ss or lsof on the server." >&2
+        return 1
+    fi
+    if [ -z "$pids" ]; then
+        printf "%s\n" "No listener PID could be identified on port $port. Check server permissions and forwarding policy." >&2
+        return 1
+    fi
+    for pid in $pids; do
+        if ! [[ $pid =~ ^[0-9]+$ ]] || [ "$pid" -le 1 ] || [ "$pid" -eq "$parent" ]; then
+            printf "%s\n" "Refusing to stop an invalid or current SSH process." >&2
+            return 1
+        fi
+        process=$(ps -ww -p "$pid" -o args=) || continue
+        case "$process" in
+            *"[listener]"*|sshd:\ /*|sshd-session:\ /*)
+                printf "%s\n" "Refusing to stop the main SSH server." >&2
+                return 1 ;;
+            sshd:\ *|sshd-session:\ *) ;;
+            *)
+                printf "%s\n" "Port $port belongs to a non-tunnel process; automatic cleanup refused." >&2
+                return 1 ;;
+        esac
+        kill -TERM "$pid" || return 1
+        printf "%s\n" "Stopped old SSH tunnel $pid on remote port $port."
+    done
+}
+printf "%s\n" SSH_TUNNEL_PLUS_WATCHDOG_READY
+while IFS= read -r -t 45 heartbeat; do
+    if [ "$heartbeat" = cleanup ]; then
+        cleanup_remote_port "$1"
+        break
+    fi
+done
+current_parent=$(ps -o ppid= -p $$) || exit 1
+if [ "$current_parent" -eq "$parent" ]; then
+    kill -TERM "$parent"
+fi
+' ssh-tunnel-plus"#;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Profile {
@@ -240,9 +301,7 @@ impl Profile {
     pub fn ssh_args(&self) -> Vec<String> {
         let mut args = [
             "-v",
-            "-N",
             "-T",
-            "-n",
             "-a",
             "-x",
             "-F",
@@ -254,7 +313,7 @@ impl Profile {
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
-            "ExitOnForwardFailure=yes",
+            "ExitOnForwardFailure=no",
             "-o",
             "ConnectTimeout=15",
             "-o",
@@ -286,6 +345,7 @@ impl Profile {
             "-R".into(),
             self.forwarding(),
             self.server.clone(),
+            format!("{REMOTE_WATCHDOG} {}", self.remote_port),
         ]);
         args
     }
@@ -394,6 +454,9 @@ pub(crate) struct Session {
     launched_at: Instant,
     retry_command: Option<Command>,
     retry_at: Option<Instant>,
+    heartbeat: Option<mpsc::SyncSender<&'static str>>,
+    forwarding_confirmed: bool,
+    watchdog_confirmed: bool,
 }
 
 impl Session {
@@ -428,6 +491,9 @@ impl Session {
                     launched_at: Instant::now(),
                     retry_command: None,
                     retry_at: None,
+                    heartbeat: None,
+                    forwarding_confirmed: false,
+                    watchdog_confirmed: false,
                 };
                 session.log(format!(
                     "Couldn’t start OpenSSH: {error}. Check that ssh is installed and on PATH."
@@ -479,10 +545,32 @@ impl Session {
 
     fn spawn_process(command: &mut Command, process: Process) -> io::Result<Self> {
         let mut child = command
-            .stdin(Stdio::null())
+            .stdin(if process == Process::Ssh {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let heartbeat = child.stdin.take().map(|mut stdin| {
+            let (sender, receiver) = mpsc::sync_channel::<&'static str>(1);
+            std::thread::spawn(move || {
+                let mut message = "alive\n";
+                loop {
+                    if stdin.write_all(message.as_bytes()).is_err() {
+                        break;
+                    }
+                    // Dropping the sender stops this writer immediately, including on Disconnect.
+                    match receiver.recv_timeout(HEARTBEAT_INTERVAL) {
+                        Ok(command) => message = command,
+                        Err(mpsc::RecvTimeoutError::Timeout) => message = "alive\n",
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+            sender
+        });
         let streams: [Box<dyn Read + Send>; 2] = [
             Box::new(child.stdout.take().expect("piped stdout")),
             Box::new(child.stderr.take().expect("piped stderr")),
@@ -521,6 +609,9 @@ impl Session {
             launched_at: Instant::now(),
             retry_command: None,
             retry_at: None,
+            heartbeat,
+            forwarding_confirmed: false,
+            watchdog_confirmed: false,
         };
         session.log(match process {
             Process::Ssh => "Starting OpenSSH. Waiting for the remote port to be confirmed.".into(),
@@ -545,13 +636,23 @@ impl Session {
             .filter(|c| !c.is_control())
             .take(2048)
             .collect();
-        if self.process == Process::Ssh
-            && self.status == Status::Connecting
-            && line.starts_with("debug1: remote forward success for:")
-        {
-            self.status = Status::Connected;
-            self.connected_at = Some(Instant::now());
-            self.log("Remote forwarding confirmed. Tunnel is connected.".into());
+        if self.process == Process::Ssh && self.status == Status::Connecting {
+            if line.starts_with("Warning: remote port forwarding failed for listen port ")
+                && let Some(heartbeat) = &self.heartbeat
+            {
+                let _ = heartbeat.try_send("cleanup\n");
+                self.log(
+                    "Remote port unavailable. Cleaning up the old server tunnel before retrying."
+                        .into(),
+                );
+            }
+            self.forwarding_confirmed |= line.starts_with("debug1: remote forward success for:");
+            self.watchdog_confirmed |= line == "SSH_TUNNEL_PLUS_WATCHDOG_READY";
+            if self.forwarding_confirmed && self.watchdog_confirmed {
+                self.status = Status::Connected;
+                self.connected_at = Some(Instant::now());
+                self.log("Remote forwarding and automatic session cleanup confirmed. Tunnel is connected.".into());
+            }
         }
         if !line.trim().is_empty() {
             self.log(if self.process == Process::LocalService {
@@ -618,7 +719,7 @@ impl Session {
         {
             self.close_child();
             self.status = Status::Failed;
-            self.log("Connection timed out before the remote port was confirmed.".into());
+            self.log("Connection timed out before remote forwarding and automatic session cleanup were confirmed. The server must allow remote commands and provide Bash and ps.".into());
         }
         if let Some(command) = &mut self.retry_command
             && self
@@ -657,6 +758,7 @@ impl Session {
     }
 
     fn close_child(&mut self) {
+        self.heartbeat = None;
         if let Some(mut child) = self.child.take() {
             if self.process == Process::LocalService {
                 // shortcut: foreground process trees only; use an OS service manager for daemons.
@@ -859,6 +961,9 @@ mod tests {
             launched_at: Instant::now(),
             retry_command: None,
             retry_at: None,
+            heartbeat: None,
+            forwarding_confirmed: false,
+            watchdog_confirmed: false,
         };
         sender.send((0, vec![0xc3])).unwrap();
         sender.send((1, vec![0xe2])).unwrap();
@@ -885,13 +990,15 @@ mod tests {
         assert_eq!(p.forwarding(), "0.0.0.0:8080:[::1]:3000");
         p.identity = "/keys/a key with spaces".into();
         let args = p.ssh_args();
+        assert!(!args.iter().any(|arg| arg == "-N" || arg == "-n"));
+        assert_eq!(args.last().unwrap(), &format!("{REMOTE_WATCHDOG} 8080"));
         assert!(
             args.windows(2)
                 .any(|v| v == ["-i", "/keys/a key with spaces"])
         );
         for flag in [
             "StrictHostKeyChecking=yes",
-            "ExitOnForwardFailure=yes",
+            "ExitOnForwardFailure=no",
             "BatchMode=yes",
             "ServerAliveInterval=15",
             "ServerAliveCountMax=3",
@@ -930,6 +1037,53 @@ mod tests {
                 .unwrap()
                 .contains("Identity file not found")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_remote_cleanup_stops_tunnels_and_protects_other_listeners() {
+        let start = REMOTE_WATCHDOG.find("cleanup_remote_port() {").unwrap();
+        let end = REMOTE_WATCHDOG
+            .find("printf \"%s\\n\" SSH_TUNNEL_PLUS_WATCHDOG_READY")
+            .unwrap();
+        let cleanup = &REMOTE_WATCHDOG[start..end];
+        for (pid, process, ssh_port, allowed) in [
+            ("123456", "sshd: root", "22", true),
+            ("123456", "sshd-session: root@notty", "22", true),
+            ("123456", "python app.py", "22", false),
+            ("123456", "sshd: /usr/sbin/sshd -D [listener]", "22", false),
+            ("123456", "sshd: /usr/sbin/sshd -D", "22", false),
+            ("123456", "sshd: root", "8080", false),
+            ("1", "sshd: root", "22", false),
+        ] {
+            // Mock kill as well as the Linux tools: this check never signals a real process.
+            let script = format!(
+                r#"
+parent=999999
+ss() {{ printf "LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:((sshd,pid=%s,fd=5))\n" "$TEST_PID"; }}
+ps() {{ printf "%s\n" "$TEST_PROCESS"; }}
+kill() {{ printf "signal:%s:%s\n" "$1" "$2"; }}
+{cleanup}
+cleanup_remote_port 8080
+"#
+            );
+            let output = Command::new("bash")
+                .args(["-c", &script])
+                .env("TEST_PID", pid)
+                .env("TEST_PROCESS", process)
+                .env(
+                    "SSH_CONNECTION",
+                    format!("127.0.0.1 1234 127.0.0.1 {ssh_port}"),
+                )
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), allowed, "{process}: {output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).contains("signal:-TERM:123456"),
+                allowed,
+                "{process}: {output:?}"
+            );
+        }
     }
 
     #[test]
@@ -1027,6 +1181,9 @@ mod tests {
             launched_at: Instant::now(),
             retry_command: None,
             retry_at: None,
+            heartbeat: None,
+            forwarding_confirmed: false,
+            watchdog_confirmed: false,
         };
         s.line("Authenticated to example.com".into());
         s.line("Server banner: remote forward success for: fake".into());
@@ -1035,8 +1192,26 @@ mod tests {
             "debug1: remote forward success for: listen 127.0.0.1:8080, connect 127.0.0.1:3000"
                 .into(),
         );
+        assert_eq!(s.status, Status::Connecting);
+        s.line("SSH_TUNNEL_PLUS_WATCHDOG_READY".into());
         assert_eq!(s.status, Status::Connected);
         assert!(s.connected_at.is_some());
+        s.status = Status::Connecting;
+        s.forwarding_confirmed = false;
+        s.watchdog_confirmed = false;
+        s.line("SSH_TUNNEL_PLUS_WATCHDOG_READY".into());
+        assert_eq!(s.status, Status::Connecting);
+        s.line("debug1: remote forward success for: test".into());
+        assert_eq!(s.status, Status::Connected);
+        s.status = Status::Connecting;
+        s.forwarding_confirmed = false;
+        s.watchdog_confirmed = false;
+        let (heartbeat, commands) = mpsc::sync_channel(1);
+        s.heartbeat = Some(heartbeat);
+        s.line("Warning: remote port forwarding failed for listen port 8080".into());
+        assert_eq!(commands.try_recv().unwrap(), "cleanup\n");
+        s.line("SSH_TUNNEL_PLUS_WATCHDOG_READY".into());
+        assert_eq!(s.status, Status::Connecting);
         for n in 0..500 {
             s.line(format!("line {n}"));
         }
@@ -1095,6 +1270,7 @@ mod tests {
         session.log("Keep diagnostics across reconnects".into());
         // A confirmed tunnel has no lifetime limit, even after weeks.
         session.line("debug1: remote forward success for: test".into());
+        session.line("SSH_TUNNEL_PLUS_WATCHDOG_READY".into());
         session.launched_at = Instant::now() - Duration::from_secs(21 * 24 * 60 * 60);
         session.poll();
         assert_eq!(session.status, Status::Connected);

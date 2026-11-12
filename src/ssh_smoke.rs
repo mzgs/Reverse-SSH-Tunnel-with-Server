@@ -142,7 +142,7 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
         local_autostart: true,
         autostart: false,
     };
-    let ssh_command = || {
+    let ssh_command = |profile: &Profile| {
         let mut command = Command::new("ssh");
         command.args([
             "-o".to_string(),
@@ -155,7 +155,7 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
         command.args(profile.ssh_args());
         command
     };
-    let start = || Session::spawn(ssh_command()).unwrap();
+    let start = || Session::spawn(ssh_command(&profile)).unwrap();
     // The production strict-host-key policy must reject even a reachable server.
     let mut unknown = start();
     wait_for_exit_or_ready(&mut unknown);
@@ -168,19 +168,132 @@ fn forwards_real_traffic_rejects_untrusted_hosts_and_reports_port_conflicts() {
     );
     let public_key = fs::read_to_string(directory.join("host.pub")).unwrap();
     fs::write(&known_hosts, format!("[127.0.0.1]:{ssh_port} {public_key}")).unwrap();
-    let mut tunnel = Session::start_ssh(ssh_command());
-    wait_for_exit_or_ready(&mut tunnel);
-    assert_eq!(tunnel.status, Status::Connected, "{:?}", tunnel.logs);
+    // An older, untracked tunnel has no watchdog or app ownership marker.
+    let command = ssh_command(&profile);
+    let args: Vec<_> = command.get_args().collect();
+    let mut legacy_command = Command::new("ssh");
+    legacy_command
+        .args(["-N", "-n"])
+        .args(&args[..args.len() - 1]);
+    let mut legacy = Session::spawn(legacy_command).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !legacy.forwarding_confirmed {
+        legacy.poll();
+        assert!(Instant::now() < deadline, "{:?}", legacy.logs);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     check_traffic(&local, remote_port);
-    let mut conflict = start();
+    let mut tunnel = Session::start_ssh(ssh_command(&profile));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while tunnel.status != Status::Connected {
+        tunnel.poll();
+        assert!(Instant::now() < deadline, "{:?}", tunnel.logs);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    legacy.poll();
+    assert!(!legacy.active(), "Old tunnel was not terminated");
+    check_traffic(&local, remote_port);
+    assert!(
+        tunnel
+            .logs
+            .iter()
+            .any(|line| line.contains("Stopped old SSH tunnel"))
+    );
+
+    let protected_service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let protected_profile = Profile {
+        remote_port: protected_service.local_addr().unwrap().port(),
+        ..profile.clone()
+    };
+    let mut conflict = Session::spawn(ssh_command(&protected_profile)).unwrap();
     wait_for_exit_or_ready(&mut conflict);
     assert_eq!(conflict.status, Status::Failed, "{:?}", conflict.logs);
     assert!(
         conflict
             .logs
             .iter()
-            .any(|line| line.contains("remote port forwarding failed"))
+            .any(|line| line.contains("non-tunnel process; automatic cleanup refused"))
     );
+    assert!(TcpStream::connect(protected_service.local_addr().unwrap()).is_ok());
+    let ssh_port_profile = Profile {
+        remote_port: ssh_port,
+        ..profile.clone()
+    };
+    let mut conflict = Session::spawn(ssh_command(&ssh_port_profile)).unwrap();
+    wait_for_exit_or_ready(&mut conflict);
+    assert_eq!(conflict.status, Status::Failed, "{:?}", conflict.logs);
+    assert!(
+        conflict
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Refusing to stop the SSH server listening"))
+    );
+    assert!(fixture.sshd.as_mut().unwrap().try_wait().unwrap().is_none());
+
+    // A stopped client cannot send even TCP FIN/RST or buffered heartbeats to the server.
+    let stranded_local = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stranded_profile = Profile {
+        remote_port: port_reservation.local_addr().unwrap().port(),
+        local_port: stranded_local.local_addr().unwrap().port(),
+        ..profile.clone()
+    };
+    drop(port_reservation);
+    let mut stranded = Session::start_ssh(ssh_command(&stranded_profile));
+    wait_for_exit_or_ready(&mut stranded);
+    assert_eq!(stranded.status, Status::Connected, "{:?}", stranded.logs);
+    let stranded_pid = stranded.child.as_ref().unwrap().id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-STOP", &stranded_pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(55);
+    while TcpStream::connect(("127.0.0.1", stranded_profile.remote_port)).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "Watchdog did not release the stranded session's remote port"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        stranded
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none()
+    );
+    tunnel.poll();
+    assert_eq!(tunnel.status, Status::Connected, "{:?}", tunnel.logs);
+    check_traffic(&local, remote_port);
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-CONT", &stranded_pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        stranded.poll();
+        if stranded.status == Status::Connected
+            && stranded.child.as_ref().unwrap().id().to_string() != stranded_pid
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", stranded.logs);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The resumed client may briefly deliver connection probes queued before cleanup.
+    stranded_local.set_nonblocking(true).unwrap();
+    while stranded_local.accept().is_ok() {}
+    check_traffic(&stranded_local, stranded_profile.remote_port);
+    stranded.stop();
+    assert!(stranded.heartbeat.is_none());
 
     // Kill the client without requesting Disconnect, then recover real forwarding.
     let child = tunnel.child.as_mut().unwrap();
