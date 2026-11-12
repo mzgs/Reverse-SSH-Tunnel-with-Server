@@ -76,7 +76,8 @@ def main():
         print(f"Release commit and {tag} are saved locally. After fixing the push failure, retry:\n"
               f"{shlex.join(('git', *push))}", file=sys.stderr)
         raise
-    print(f"Pushed {tag}. GitHub Actions will build all four platforms and publish the release.")
+    print(f"Pushed {tag}. GitHub Actions will build all four platforms, self-sign macOS apps with the pinned "
+          "certificate, and publish only after every check succeeds. macOS releases are not Apple-notarized.")
 
 
 if __name__ == "__main__":

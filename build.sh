@@ -10,6 +10,17 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 0
 fi
 
+if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+    pinned_identity=$(cat resources/signing-certificate.sha1)
+    case "$pinned_identity" in
+        ''|*[!A-F0-9]*) printf '%s\n' 'Invalid pinned signing certificate fingerprint.' >&2; exit 1 ;;
+    esac
+    if [ "${#pinned_identity}" -ne 40 ] || [ "$MACOS_SIGNING_IDENTITY" != "$pinned_identity" ]; then
+        printf '%s\n' 'MACOS_SIGNING_IDENTITY must match resources/signing-certificate.sha1.' >&2
+        exit 1
+    fi
+fi
+
 host=$(rustup run stable rustc -vV | sed -n 's/^host: //p')
 rustup run stable cargo build --release --locked --target "$host" --target-dir target
 version=$(rustup run stable cargo pkgid --offline | sed 's/.*@//')
@@ -37,6 +48,12 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$bundle/Contents/Info.plist"
-codesign --force --sign - --timestamp=none "$bundle"
+if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+    requirement="identifier \"$identifier\" and certificate leaf = H\"$MACOS_SIGNING_IDENTITY\""
+    codesign --force --sign "$MACOS_SIGNING_IDENTITY" --timestamp=none --requirements "=designated => $requirement" "$bundle"
+    codesign --verify --strict --test-requirement "=$requirement" "$bundle"
+else
+    codesign --force --sign - --timestamp=none "$bundle"
+fi
 codesign --verify --deep --strict "$bundle"
 printf 'Built %s\nOpen it with: open "%s"\n' "$bundle" "$bundle"

@@ -40,7 +40,7 @@ All platforms require **OpenSSH 8.0 or later** on PATH. Check it in Terminal or 
 
 1. Download the ZIP for your processor. Check **Apple menu → About This Mac** if unsure.
 2. Extract it and move **SSH Tunnel Plus.app** to **Applications** before opening it.
-3. Open the app. The bundle is ad hoc signed and is not notarized by Apple, so macOS may block the first launch. If you trust the download, use **System Settings → Privacy & Security → Open Anyway** after trying to open it, then confirm.
+3. Open the app. Releases use a persistent self-signed certificate and are **not notarized by Apple**, so macOS may block the launch with an unverified developer warning. If you trust the download, use **System Settings → Privacy & Security → Open Anyway** after trying to open it, then confirm.
 
 OpenSSH is included with macOS. Launch at login requires macOS 13 or later.
 
@@ -125,7 +125,7 @@ cd Reverse-SSH-Tunnel-with-Server
 cargo run --locked
 ```
 
-- **macOS:** install the Xcode Command Line Tools (`xcode-select --install`). OpenSSH is included. `./run.sh` also starts the app; `./build.sh` produces the ad hoc signed `target/release/SSH Tunnel Plus.app`.
+- **macOS:** install the Xcode Command Line Tools (`xcode-select --install`). OpenSSH is included. `./run.sh` also starts the app; `./build.sh` produces `target/release/SSH Tunnel Plus.app`, ad hoc signed by default for local development. To use the release identity locally, import the release `.p12` into your login keychain, then run `MACOS_SIGNING_IDENTITY="$(cat resources/signing-certificate.sha1)" ./build.sh`.
 - **Windows 10/11:** use the Rust MSVC toolchain with Visual Studio C++ Build Tools and a Windows SDK. Enable the **OpenSSH Client** optional feature. `cargo build --release --locked` creates `target/release/reverse-ssh-tunnel-with-server.exe`.
 - **Linux:** use a desktop session and a Vulkan-capable GPU/driver. On Ubuntu 24.04, install:
 
@@ -159,6 +159,25 @@ It checks traffic in both directions, unknown-host rejection, remote-port confli
 
 ## Publishing a release (maintainers)
 
+macOS releases use **one persistent self-signed code-signing certificate**. No Apple Developer account or notarization credentials are needed. Both Mac architectures and all later versions use the same private key. These two repository secrets are configured under **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERTIFICATE_BASE64` | Base64 of the password-protected `.p12` exported from Keychain Access, including the certificate and private key. Copy it with `base64 -i /path/to/signing.p12 \| pbcopy`. |
+| `MACOS_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12`. |
+
+The public SHA-1 certificate fingerprint is pinned in `resources/signing-certificate.sha1`; it is an identity selector, not the signature's hashing algorithm. The bundle identifier stays `local.reverse-ssh-tunnel-with-server`. The workflow imports the existing certificate into a temporary keychain, signs each app with a designated requirement matching that certificate and bundle identifier, verifies the signature, and packages the result. Missing credentials, a different certificate, or a failed signature check blocks publication. Releases never generate a new certificate or fall back to ad hoc signing. The temporary keychain is deleted even if a build fails.
+
+The maintainer's certificate backup is outside the repository at `~/Library/Application Support/SSH Tunnel Plus/release-signing/`: `certificate.p12` contains the private key, `password.txt` contains its password, and `certificate.pem` is the public certificate. Back up this folder securely; do not commit it or regenerate the certificate for each release. To restore the GitHub secrets using an authenticated [GitHub CLI](https://cli.github.com/manual/gh_secret_set), run from this repository:
+
+```sh
+signing_dir="$HOME/Library/Application Support/SSH Tunnel Plus/release-signing"
+base64 -i "$signing_dir/certificate.p12" | gh secret set MACOS_CERTIFICATE_BASE64
+gh secret set MACOS_CERTIFICATE_PASSWORD < "$signing_dir/password.txt"
+```
+
+Stable signing lets macOS recognize updates for permission checks ([Apple's explanation](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)). Moving from an old ad hoc signed release can require approval once more. Self-signing does **not** remove the unverified developer warning or guarantee that all permission prompts disappear. Users still approve a trusted download through **Privacy & Security → Open Anyway**; do not disable Gatekeeper or install a trusted root certificate. Install updates in the same location, normally `/Applications`.
+
 Commit the release tooling and your changes first. With Python **3.11+**, Git, and a clean working tree on a branch that already exists on `origin`, run:
 
 ```sh
@@ -170,6 +189,6 @@ The script updates only this app's version in `Cargo.toml` and `Cargo.lock`, com
 
 The [release workflow](.github/workflows/release.yml) builds natively using GitHub's [hosted runners](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job). Once every build succeeds, it [publishes a GitHub Release](https://cli.github.com/manual/gh_release_create) with generated notes, `SHA256SUMS`, and the four platform archives listed in [Download and install](#download-and-install).
 
-GitHub Actions uses its built-in `GITHUB_TOKEN` to publish; no additional release secret is required. Watch the repository's **Actions → Release** page. If a build fails, fix its cause and rerun the failed jobs, or commit the fix and create another patch release. If the push fails, the script keeps the local release commit and tag and prints the exact push command to retry; it does not reset your work.
+GitHub Actions uses its built-in `GITHUB_TOKEN` to publish and the two certificate secrets above for macOS signing. Watch the repository's **Actions → Release** page. If a build fails, fix its cause and rerun the failed jobs, or commit the fix and create another patch release. If the push fails, the script keeps the local release commit and tag and prints the exact push command to retry; it does not reset your work.
 
-macOS bundles are ad hoc signed, without Apple notarization; Windows binaries are unsigned. Linux binaries target Ubuntu 24.04 or a compatible newer desktop and need the runtime libraries listed above. OpenSSH remains a runtime requirement on every platform. Validate the release tooling locally with `python3 -m unittest test_release`; this uses a temporary local Git remote and never publishes anything.
+Windows binaries remain unsigned. Linux binaries target Ubuntu 24.04 or a compatible newer desktop and need the runtime libraries listed above. OpenSSH remains a runtime requirement on every platform. Validate the release tooling locally with `python3 -m unittest test_release`; this uses a temporary local Git remote and mocked Apple tools and never publishes anything.

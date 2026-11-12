@@ -57,12 +57,38 @@ jobs:
           sudo apt-get install -y gcc g++ clang cmake pkg-config libfontconfig-dev \
             libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev \
             libzstd-dev libasound2-dev libvulkan-dev
-      - name: Build and package macOS app
+      - name: Self-sign and package macOS app
         if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
+          for name in MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name. Reuse the existing self-signed certificate for every release."
+              exit 1
+            fi
+          done
+          export MACOS_SIGNING_IDENTITY="$(cat resources/signing-certificate.sha1)"
+          : "${MACOS_SIGNING_IDENTITY:?Missing pinned signing certificate fingerprint}"
+          umask 077
+          certificate="$RUNNER_TEMP/signing.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          trap 'rm -f "$certificate"; security delete-keychain "$keychain" >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          keychain_password=$(openssl rand -hex 32)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -k "$keychain" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          rm -f "$certificate"
+          umask 022
           ./build.sh
+          bundle="target/release/SSH Tunnel Plus.app"
           mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent "target/release/SSH Tunnel Plus.app" \
+          ditto -c -k --sequesterRsrc --keepParent "$bundle" \
             "dist/ssh-tunnel-plus-$GITHUB_REF_NAME-$PLATFORM.zip"
       - name: Build Windows and Linux binaries
         if: runner.os != 'macOS'

@@ -24,3 +24,7 @@ rustc-ice-*.txt
 #.idea/
 .DS_Store
 __pycache__/
+
+# Release signing private-key archives belong outside the repository.
+*.p12
+*.pfx

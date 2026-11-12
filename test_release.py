@@ -1,11 +1,13 @@
 """Run with python3 -m unittest test_release. Never contacts GitHub."""
 
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 import unittest
 
@@ -13,6 +15,115 @@ from release import bump
 
 
 class ReleaseTest(unittest.TestCase):
+    def test_macos_self_signing(self):
+        source = Path(__file__).resolve().parent
+        workflow = (source / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: Self-sign and package macOS app\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy2(source / "build.sh", root / "build.sh")
+            (root / "resources").mkdir()
+            (root / "resources/app-icon.icns").write_bytes(b"icon")
+            pin = root / "resources/signing-certificate.sha1"
+            shutil.copy2(source / "resources/signing-certificate.sha1", pin)
+            identity = pin.read_text().strip()
+            for host in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+                binary = root / f"target/{host}/release/reverse-ssh-tunnel-with-server"
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"binary")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            tool = fake_bin / "tool"
+            tool.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+                import json, os, sys
+                from pathlib import Path
+                name, args = Path(sys.argv[0]).name, sys.argv[1:]
+                with open(os.environ["COMMAND_LOG"], "a") as log:
+                    log.write(json.dumps([name, *args]) + "\\n")
+                if os.environ.get("FAIL_TOOL") == name:
+                    sys.exit(1)
+                if name == "codesign" and "--verify" in args and os.environ.get("FAIL_VERIFY"):
+                    sys.exit(1)
+                if name == "codesign" and "--sign" in args:
+                    signer = args[args.index("--sign") + 1]
+                    if signer != "-" and signer != os.environ["IMPORTED_IDENTITY"]:
+                        sys.exit(1)
+                if name == "uname":
+                    print("Darwin")
+                elif name == "rustup" and "rustc" in args:
+                    print("host: " + os.environ["TEST_HOST"])
+                elif name == "rustup" and "pkgid" in args:
+                    print("app@0.1.5")
+                elif name == "openssl":
+                    print("temporary-keychain-password")
+                elif name == "ditto":
+                    Path(args[-1]).write_text("archive")
+                '''))
+            tool.chmod(0o755)
+            for name in ("uname", "rustup", "plutil", "codesign", "security", "openssl", "ditto", "xcrun", "spctl"):
+                (fake_bin / name).symlink_to(tool)
+            credentials = {
+                "MACOS_CERTIFICATE_BASE64": "Y2VydA==",
+                "MACOS_CERTIFICATE_PASSWORD": "fake-certificate-password",
+            }
+            env = {**os.environ, **credentials, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                   "COMMAND_LOG": str(root / "commands.jsonl"), "RUNNER_TEMP": str(root),
+                   "GITHUB_REF_NAME": "v0.1.5", "PLATFORM": "macos-arm64",
+                   "MACOS_SIGNING_IDENTITY": identity, "IMPORTED_IDENTITY": identity,
+                   "TEST_HOST": "aarch64-apple-darwin"}
+
+            def run(command, overrides=None):
+                shutil.rmtree(root / "dist", ignore_errors=True)
+                (root / "commands.jsonl").write_text("")
+                result = subprocess.run(command, cwd=root, env={**env, **(overrides or {})},
+                                        capture_output=True, text=True)
+                calls = [json.loads(line) for line in (root / "commands.jsonl").read_text().splitlines()]
+                return result, calls
+
+            for missing in credentials:
+                result, calls = run(["bash", "-e", "-o", "pipefail", "-c", script], {missing: ""})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Missing repository secret: {missing}", result.stdout)
+                self.assertEqual(calls, [])
+
+            for host in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+                result, calls = run(["bash", "-e", "-o", "pipefail", "-c", script], {"TEST_HOST": host})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((root / "target/release/SSH Tunnel Plus.app/Contents/Info.plist").stat().st_mode & 0o777, 0o644)
+                signing = next(call for call in calls if call[:2] == ["codesign", "--force"])
+                self.assertIn(identity, signing)
+                self.assertIn("--timestamp=none", signing)
+                self.assertIn("--requirements", signing)
+                requirement = next(call for call in calls if "--test-requirement" in call)
+                self.assertEqual(requirement[-2], f'=identifier "local.reverse-ssh-tunnel-with-server" and certificate leaf = H"{identity}"')
+                self.assertFalse(any(call[0] in ("xcrun", "spctl") for call in calls))
+                verify = max(i for i, call in enumerate(calls) if call[:2] == ["codesign", "--verify"])
+                package = next(i for i, call in enumerate(calls) if call[0] == "ditto")
+                self.assertLess(verify, package)
+                self.assertEqual(calls[-1][:2], ["security", "delete-keychain"])
+                self.assertTrue(list((root / "dist").glob("*.zip")))
+
+            for failure in ({"FAIL_TOOL": "codesign"}, {"FAIL_VERIFY": "1"},
+                            {"IMPORTED_IDENTITY": "0" * 40}, {"FAIL_TOOL": "security"}):
+                result, calls = run(["bash", "-e", "-o", "pipefail", "-c", script], failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "dist").exists())
+                self.assertEqual(calls[-1][:2], ["security", "delete-keychain"])
+
+            result, calls = run(["sh", "build.sh"], {"MACOS_SIGNING_IDENTITY": ""})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(any(call[:4] == ["codesign", "--force", "--sign", "-"] for call in calls))
+            for invalid in ({"MACOS_SIGNING_IDENTITY": "-"}, {"MACOS_SIGNING_IDENTITY": "0" * 40}):
+                result, calls = run(["sh", "build.sh"], invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(call[0] == "rustup" for call in calls))
+            for invalid_pin in ("", "not a fingerprint", "ABCD"):
+                pin.write_text(invalid_pin)
+                result, calls = run(["bash", "-e", "-o", "pipefail", "-c", script])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "dist").exists())
+
     def test_release_against_local_remote(self):
         source = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as directory:
